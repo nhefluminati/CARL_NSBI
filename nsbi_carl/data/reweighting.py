@@ -1,0 +1,63 @@
+"""Pipeline step: NSBI weight rescaling.
+
+Two stages, executed in this order (the order matters):
+
+1. **Reference equalization.** Every reference sample is rescaled so that its
+   total event weight is identical (normalized to 1). All reference samples
+   therefore contribute the same effective statistics to the training.
+
+2. **Target/reference balancing.** The target weights are multiplied by
+   ``w_reference_train.sum() / w_target_train.sum()`` where the sums run over
+   the TRAIN split only. The resulting scalar is then applied to *all* target
+   events — train, validation and test — so the validation/test sets use the
+   numerically identical reweighting as the training set.
+
+All scale factors are returned so the pipeline can persist them in the run
+record YAML.
+"""
+
+from __future__ import annotations
+
+import numpy as np
+import torch
+
+from .dataset import NSBIDataset, SplitIndices
+
+
+class ReweightStep:
+    def apply(self, dataset: NSBIDataset, splits: SplitIndices) -> dict:
+        w = dataset.w.numpy().reshape(-1).astype(np.float64).copy()
+        y = dataset.y.numpy().reshape(-1)
+
+        # -- 1) equalize reference samples (before target/ref balancing) ---
+        reference_scales: dict[str, float] = {}
+        for sid, name in enumerate(dataset.sample_names):
+            mask = (dataset.sample_id == sid) & (y == 0.0)
+            if not mask.any():
+                continue  # target sample
+            total = w[mask].sum()
+            if total <= 0:
+                raise ValueError(f"Reference sample '{name}' has non-positive total weight.")
+            scale = 1.0 / total
+            w[mask] *= scale
+            reference_scales[name] = float(scale)
+
+        # -- 2) balance target vs reference on the TRAIN split -------------
+        train = splits.train
+        y_train = y[train]
+        target_train_sum = w[train][y_train == 1.0].sum()
+        reference_train_sum = w[train][y_train == 0.0].sum()
+        if target_train_sum <= 0 or reference_train_sum <= 0:
+            raise ValueError("Train split must contain positive target and reference yields.")
+
+        target_scale = float(reference_train_sum / target_train_sum)
+        w[y == 1.0] *= target_scale  # identical value applied to train/val/test
+
+        dataset.w = torch.as_tensor(w, dtype=torch.float64).reshape(-1, 1)
+
+        return {
+            "reference_sample_scales": reference_scales,
+            "target_balance_scale": target_scale,
+            "train_target_yield": float(target_train_sum * target_scale),
+            "train_reference_yield": float(reference_train_sum),
+        }

@@ -1,0 +1,68 @@
+# Full pipeline configuration.
+# Run with:  python -m nsbi_carl.train --config configs/example.yaml
+
+run_name: sbi_vs_ref
+output_dir: outputs/sbi_vs_ref
+seed: 52                          # controls split + shuffles; ensemble seeds set below
+
+data:
+  target_paths:                   # label 1
+    - data/signal_SBI.h5
+  reference_paths:                # label 0; each sample is equalized before target/ref balancing
+    - data/background_qqZZ.h5
+    - data/background_ggZZ.h5
+  features: [m4l, mTZZ]           # selection AND input order; persisted to the run record
+  weight_key: weight              # name of the weight dataset inside the .h5 files
+
+split:
+  train_fraction: 0.8
+  val_fraction: 0.1               # test fraction = 1 - train - val
+
+model:
+  n_layers: 5
+  n_nodes: 256
+  dropout: 0.0
+  scheduler:                      # CosineAnnealingWarmRestarts
+    t0: 25                        # restart period (epochs)
+    t_mult: 1                     # period multiplication factor after each restart
+    eta_min: 1.0e-8
+
+training:
+  batch_size: 512
+  val_batch_size: 2048
+  learning_rate: 1.0e-4           # SGD
+  momentum: 0.0
+  max_epochs: 400
+  early_stopping_patience: 25
+  num_workers: 4
+  gpus: [0, 1, 2, 3]              # [] -> CPU; single model uses all via DDP, ensemble round-robins
+  resume_from: null               # path to a .ckpt to continue a single-model training
+
+ensemble:
+  enabled: true
+  n_members: 8
+  start_seed: 100                 # member i trains with seed start_seed + i
+  bootstrap: true
+  bootstrap_fraction: 1.0
+  workers_per_gpu: 1
+  start_member: 0                 # set > 0 to extend/resume an existing ensemble
+
+evaluation:
+  during_training:                # executed at end of validation, per its own schedule
+    metrics:
+      - name: density_ratio_integral
+        every_n_epochs: 1
+    plots:
+      - name: calibration_curve
+        every_n_epochs: 25
+        kwargs: {n_bins: 30}
+  after_training:                 # single model: on the test split.
+    metrics:                      # ensemble: once for the ENTIRE ensemble on the test split.
+      - name: density_ratio_integral
+    plots:
+      - name: loss_curves
+      - name: calibration_curve
+      - name: reweighting
+        kwargs: {feature: m4l}
+      - name: reweighting
+        kwargs: {feature: mTZZ, log_y: true}

@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nsbi-carl"
+version = "0.1.0"
+description = "Composable training pipeline for CARL/NSBI classifier ensembles"
+requires-python = ">=3.10"
+dependencies = [
+    "torch>=2.0",
+    "lightning>=2.0",
+    "numpy",
+    "h5py",
+    "pyyaml",
+    "matplotlib",
+]
+
+[tool.setuptools.packages.find]
+include = ["nsbi_carl*"]
