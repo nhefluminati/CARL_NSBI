@@ -35,6 +35,7 @@ class ReweightStep:
             mask = (dataset.sample_id == sid) & (y == 0.0)
             if not mask.any():
                 continue  # target sample
+            w[mask] = 1 # setting all weights to 1 in reference is a very easy way to construct a synthetic distribution from physics processes with the desired domain
             total = w[mask].sum()
             if total <= 0:
                 raise ValueError(f"Reference sample '{name}' has non-positive total weight.")
@@ -50,11 +51,11 @@ class ReweightStep:
         if target_train_sum <= 0 or reference_train_sum <= 0:
             raise ValueError("Train split must contain positive target and reference yields.")
 
-        target_scale = float(reference_train_sum / target_train_sum)
+        target_scale = float(reference_train_sum * 1e+6 / target_train_sum)
         w[y == 1.0] *= target_scale  # identical value applied to train/val/test
 
         dataset.w = torch.as_tensor(w, dtype=torch.float64).reshape(-1, 1)
-
+        print(f"weight average: {torch.mean(dataset.w)}")
         return {
             "reference_sample_scales": reference_scales,
             "target_balance_scale": target_scale,
