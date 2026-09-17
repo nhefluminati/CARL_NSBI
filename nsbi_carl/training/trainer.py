@@ -48,6 +48,11 @@ class TrainerConfig:
     checkpoint_every_n_epochs: int = 1
     progress_bar: bool = True
     log_every_n_steps: int = 50
+    # Kill switch for PyTorch's JIT-compiled "native" DSL ops. Those compile a
+    # Triton/CUDA shim at runtime and need a C toolchain plus the Python
+    # development headers on the compute node; where those are missing they
+    # raise CalledProcessError mid-training. Set true on such nodes.
+    disable_native_jit: bool = False
 
 
 @dataclass
@@ -219,6 +224,10 @@ class CARLTrainer:
             self.config.gpus = gpus_override
 
         L.seed_everything(seed, workers=True)
+        if self.config.disable_native_jit:
+            import os
+
+            os.environ["TORCH_DISABLE_NATIVE_JIT"] = "1"
         # TF32 on the tensor cores: for fp32 MLPs this is close to free speed.
         torch.set_float32_matmul_precision(self.config.matmul_precision)
         torch.backends.cudnn.benchmark = True

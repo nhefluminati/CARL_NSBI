@@ -115,6 +115,9 @@ def _train_member_worker(
     for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
         os.environ.setdefault(var, "1")
 
+    if trainer_config.get("disable_native_jit"):
+        os.environ["TORCH_DISABLE_NATIVE_JIT"] = "1"
+
     dataset, splits = _load_snapshot(snapshot_path)
     tconf = TrainerConfig(**trainer_config)
     tconf.gpus = [gpu_id] if gpu_id is not None else []
@@ -205,6 +208,9 @@ def _train_group_worker(
 
     for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
         os.environ.setdefault(var, "1")
+
+    if trainer_config.get("disable_native_jit"):
+        os.environ["TORCH_DISABLE_NATIVE_JIT"] = "1"
 
     import torch as _torch
 

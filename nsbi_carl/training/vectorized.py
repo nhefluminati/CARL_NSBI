@@ -97,15 +97,28 @@ class StackedMLP(nn.Module):
 
         Returns logits of shape ``(M, B)``. A shared ``(B, F)`` input is
         broadcast against the member axis without being copied M times.
+
+        The output head is deliberately NOT written as a matmul. The head's
+        weight is ``(M, H, 1)``, so ``matmul``'s backward forms the gradient
+        w.r.t. its input as ``(M, B, 1) @ (M, 1, H)`` — a batched *outer
+        product*, inner dimension 1. Recent PyTorch builds route exactly that
+        shape to a JIT-compiled Triton kernel, which needs a working C
+        toolchain and the Python development headers at runtime and hard-fails
+        on nodes that lack them. Expressing the head as a broadcast multiply
+        and a sum is mathematically identical, costs nothing (it is the
+        smallest layer in the network), and keeps the backward on plain
+        elementwise kernels.
         """
         h = x
         last = len(self.weights) - 1
         for i, (w, b) in enumerate(zip(self.weights, self.biases)):
+            if i == last:
+                # (M,B,H) * (M,1,H) -> sum over H -> (M,B)
+                return (h * w.squeeze(-1).unsqueeze(1)).sum(-1) + b.squeeze(-1)
             h = torch.matmul(h, w) + b  # broadcasts (B,F)x(M,F,H) -> (M,B,H)
-            if i != last:
-                h = F.silu(h)
-                if self.dropout > 0.0 and self.training:
-                    h = F.dropout(h, p=self.dropout, training=True)
+            h = F.silu(h)
+            if self.dropout > 0.0 and self.training:
+                h = F.dropout(h, p=self.dropout, training=True)
         return h.squeeze(-1)
 
     # -- export -------------------------------------------------------------

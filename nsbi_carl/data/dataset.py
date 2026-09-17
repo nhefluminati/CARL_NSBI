@@ -22,6 +22,24 @@ class SplitIndices:
     test: np.ndarray
 
 
+def _writable(a):
+    """A writable view of ``a``, copying only if the buffer forbids it.
+
+    Memory-mapped snapshot arrays come back read-only; a plain
+    ``np.asarray`` view over the same pages is enough for torch, and avoids
+    both the UserWarning and a full copy of the dataset.
+    """
+    a = np.asarray(a)
+    if a.flags.writeable:
+        return a
+    try:
+        view = a.view()
+        view.flags.writeable = True
+        return view
+    except ValueError:
+        return np.array(a)
+
+
 class NSBIDataset(Dataset):
     """Events from target (label 1) and reference (label 0) samples.
 
@@ -40,9 +58,13 @@ class NSBIDataset(Dataset):
         feature_names: list[str],
         split_label: np.ndarray | None = None,
     ):
-        self.x = torch.as_tensor(x, dtype=torch.float32)
-        self.y = torch.as_tensor(y, dtype=torch.float32).reshape(-1, 1)
-        self.w = torch.as_tensor(w, dtype=torch.float64).reshape(-1, 1)
+        # `torch.as_tensor` warns (once, globally) on a read-only array, which
+        # is what a memory-mapped ensemble snapshot hands us. The tensors are
+        # only ever read or copied to the device here, so mark them writable
+        # rather than copying the whole dataset just to silence it.
+        self.x = torch.as_tensor(_writable(x), dtype=torch.float32)
+        self.y = torch.as_tensor(_writable(y), dtype=torch.float32).reshape(-1, 1)
+        self.w = torch.as_tensor(_writable(w), dtype=torch.float64).reshape(-1, 1)
         self.sample_id = np.asarray(sample_id, dtype=np.int64)
         self.sample_names = list(sample_names)
         self.feature_names = list(feature_names)
