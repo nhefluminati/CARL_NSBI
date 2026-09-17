@@ -3,20 +3,19 @@
 
 run_name: sbi_vs_ref
 output_dir: outputs/sbi_vs_ref
-seed: 52                          # controls split + shuffles; ensemble seeds set below
-
+seed: 52                          
 data:
-  target_paths:                   # label 1
+  target_paths:                   # target label 1
     - data/signal_SBI.h5
-  reference_paths:                # label 0; each sample is equalized before target/ref balancing
+  reference_paths:                # target label 0
     - data/background_qqZZ.h5
     - data/background_ggZZ.h5
-  features: [m4l, mTZZ]           # selection AND input order; persisted to the run record
-  weight_key: weight              # name of the weight dataset inside the .h5 files
+  features: [m4l, mTZZ]           
+  weight_key: weight              
 
 split:
   train_fraction: 0.8
-  val_fraction: 0.1               # test fraction = 1 - train - val
+  val_fraction: 0.1               
 
 model:
   n_layers: 5
@@ -28,34 +27,51 @@ model:
     eta_min: 1.0e-8
 
 training:
-  batch_size: 512
-  val_batch_size: 2048
-  learning_rate: 1.0e-4           # SGD
-  momentum: 0.0
+
+  batch_size: 32768
+  val_batch_size: 262144
+  learning_rate: 6.0e-3
+  momentum: 0.9
+  optimizer: adamw                  # sgd | adam | adamw  
+  weight_decay: 0.0
   max_epochs: 400
-  early_stopping_patience: 25
-  num_workers: 4
-  gpus: [0, 1, 2, 3]              # [] -> CPU; single model uses all via DDP, ensemble round-robins
+  early_stopping_patience: 30
+  num_workers: 4                  # only used when performance.device_batches is false
+  gpus: [0, 1, 2, 3]              
   resume_from: null               # path to a .ckpt to continue a single-model training
+
+performance:
+  device_batches: true            # keep the split on the GPU and batch by slicing.
+                                  # Replaces DataLoader(Subset(...)), which makes one
+  matmul_precision: high          # TF32 on the tensor cores; "highest" for strict fp32
+  precision: 32-true              # bf16-mixed also works; gains are modest for tiny MLPs
+  compile: false                  # torch.compile; helps most at large batch sizes
+  save_last: false                # writing last.ckpt every epoch is pure IO
+  checkpoint_every_n_epochs: 1
+  progress_bar: true              # turn off for batch/grid jobs
 
 ensemble:
   enabled: true
   n_members: 8
   start_seed: 100                 # member i trains with seed start_seed + i
   bootstrap: true
-  bootstrap_fraction: 1.0
-  workers_per_gpu: 1
+  bootstrap_fraction: 0.8
   start_member: 0                 # set > 0 to extend/resume an existing ensemble
+
+  # "vectorized": every member assigned to a GPU trains simultaneously as one
+  #   batched matmul. M members cost roughly one member's wall time, because
+  #   the work per kernel launch grows while the launch count stays fixed.
+  # "process": the original one-member-per-process pool (kept as a fallback).
+  mode: vectorized
+  members_per_group: 0            # 0 -> all of a GPU's members in one group.
+                                  # Lower it only if a group runs out of memory.
+  workers_per_gpu: 1              # "process" mode only
 
 evaluation:
   during_training:                # executed at end of validation, per its own schedule
     metrics:
-      - name: density_ratio_integral
-        every_n_epochs: 1
     plots:
-      - name: calibration_curve
-        every_n_epochs: 25
-        kwargs: {n_bins: 30}
+      
   after_training:                 # single model: on the test split.
     metrics:                      # ensemble: once for the ENTIRE ensemble on the test split.
       - name: density_ratio_integral
@@ -65,4 +81,4 @@ evaluation:
       - name: reweighting
         kwargs: {feature: m4l}
       - name: reweighting
-        kwargs: {feature: mTZZ, log_y: true}
+        kwargs: {feature: mjj, log_y: true}

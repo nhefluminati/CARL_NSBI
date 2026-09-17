@@ -80,6 +80,10 @@ class _Scheduled:
     every_n_epochs: int = 1
 
 
+def _due(item: _Scheduled, epoch: int | None) -> bool:
+    return epoch is None or (epoch + 1) % max(1, item.every_n_epochs) == 0
+
+
 class EvaluationSuite:
     """An ordered, schedulable collection of metrics and plots.
 
@@ -103,11 +107,20 @@ class EvaluationSuite:
     def __len__(self) -> int:
         return len(self._metrics) + len(self._plots)
 
+    def due_at(self, epoch: int | None) -> bool:
+        """Is anything scheduled to run at this epoch?
+
+        Lets the training loop skip the expensive bookkeeping (buffering and
+        transferring the whole validation set) on epochs where no diagnostic
+        would consume it.
+        """
+        return any(_due(item, epoch) for item in self._metrics + self._plots)
+
     def run(self, ctx: EvaluationContext, epoch: int | None = None) -> dict[str, float]:
         """Run everything due. Returns the merged metric results."""
 
         def due(item: _Scheduled) -> bool:
-            return epoch is None or (epoch + 1) % max(1, item.every_n_epochs) == 0
+            return _due(item, epoch)
 
         results: dict[str, float] = {}
         for item in self._metrics:

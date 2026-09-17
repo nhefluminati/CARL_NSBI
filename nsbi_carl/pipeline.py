@@ -58,6 +58,7 @@ class Pipeline:
         model_cfg = config.get("model", {})
         sched_cfg = model_cfg.get("scheduler", {})
         train_cfg = config.get("training", {})
+        perf_cfg = config.get("performance", {})
         eval_cfg = config.get("evaluation", {})
         self.trainer = CARLTrainer(
             model_config=ModelConfig(
@@ -78,6 +79,15 @@ class Pipeline:
                 num_workers=train_cfg.get("num_workers", 4),
                 gpus=train_cfg.get("gpus", []) or [],
                 resume_from=train_cfg.get("resume_from"),
+                optimizer=train_cfg.get("optimizer", "sgd"),
+                weight_decay=train_cfg.get("weight_decay", 0.0),
+                precision=perf_cfg.get("precision", "32-true"),
+                device_batches=perf_cfg.get("device_batches", True),
+                matmul_precision=perf_cfg.get("matmul_precision", "high"),
+                compile=perf_cfg.get("compile", False),
+                save_last=perf_cfg.get("save_last", False),
+                checkpoint_every_n_epochs=perf_cfg.get("checkpoint_every_n_epochs", 1),
+                progress_bar=perf_cfg.get("progress_bar", True),
             ),
             output_dir=self.output_dir,
             run_name=self.run_name,
@@ -97,6 +107,8 @@ class Pipeline:
                     bootstrap_fraction=ens_cfg.get("bootstrap_fraction", 1.0),
                     workers_per_gpu=ens_cfg.get("workers_per_gpu", 1),
                     start_member=ens_cfg.get("start_member", 0),
+                    mode=ens_cfg.get("mode", "vectorized"),
+                    members_per_group=ens_cfg.get("members_per_group", 0),
                 ),
                 output_dir=self.output_dir,
                 run_name=self.run_name,

@@ -42,6 +42,13 @@ class EnsembleConfig:
     workers_per_gpu: int = 1
     start_member: int = 0  # resume an ensemble by training only members >= this
 
+    # -- performance -----------------------------------------------------
+    # "vectorized": all members assigned to a GPU train together as one
+    #   batched matmul (fastest by a wide margin for small networks).
+    # "process":    the original one-member-per-process pool.
+    mode: str = "vectorized"
+    members_per_group: int = 0  # 0 -> all members on a GPU in one group
+
 
 def bootstrap_train_indices(
     splits: SplitIndices, labels: np.ndarray, seed: int, fraction: float
@@ -107,31 +114,107 @@ def _train_member_worker(
 
 
 def _save_snapshot(path: Path, dataset: NSBIDataset, splits: SplitIndices) -> None:
-    np.savez(
-        path,
-        x=dataset.x.numpy(),
-        y=dataset.y.numpy(),
-        w=dataset.w.numpy(),
-        sample_id=dataset.sample_id,
-        sample_names=np.array(dataset.sample_names),
-        feature_names=np.array(dataset.feature_names),
-        mean=dataset.mean,
-        std=dataset.std,
-        train=splits.train,
-        val=splits.val,
-        test=splits.test,
-    )
+    """Write the prepared dataset as a directory of plain ``.npy`` files.
+
+    ``.npz`` forces every worker to parse and fully materialise its own copy
+    of the arrays: with 8 members that is 8x the dataset in RAM and 8x the
+    load time. Plain ``.npy`` files can be memory-mapped instead, so the
+    workers share one set of pages from the OS cache. The feature/label/weight
+    arrays are stored in the dtypes ``NSBIDataset`` wants, which makes the
+    subsequent ``torch.as_tensor`` a zero-copy view of the mapping.
+    """
+    path = Path(path)
+    path.mkdir(parents=True, exist_ok=True)
+    arrays = {
+        "x": dataset.x.numpy().astype(np.float32, copy=False),
+        "y": dataset.y.numpy().astype(np.float32, copy=False),
+        "w": dataset.w.numpy().astype(np.float64, copy=False),
+        "sample_id": dataset.sample_id,
+        "mean": np.asarray(dataset.mean),
+        "std": np.asarray(dataset.std),
+        "train": splits.train,
+        "val": splits.val,
+        "test": splits.test,
+    }
+    for name, arr in arrays.items():
+        np.save(path / f"{name}.npy", arr)
+    with open(path / "names.json", "w") as f:
+        json.dump(
+            {"sample_names": list(dataset.sample_names), "feature_names": list(dataset.feature_names)}, f
+        )
 
 
 def _load_snapshot(path: str) -> tuple[NSBIDataset, SplitIndices]:
-    z = np.load(path, allow_pickle=False)
+    p = Path(path)
+    load = lambda n: np.load(p / f"{n}.npy", mmap_mode="r")  # noqa: E731
+    with open(p / "names.json") as f:
+        names = json.load(f)
     dataset = NSBIDataset(
-        x=z["x"], y=z["y"], w=z["w"], sample_id=z["sample_id"],
-        sample_names=[str(s) for s in z["sample_names"]],
-        feature_names=[str(s) for s in z["feature_names"]],
+        x=load("x"), y=load("y"), w=load("w"), sample_id=np.asarray(load("sample_id")),
+        sample_names=names["sample_names"],
+        feature_names=names["feature_names"],
     )
-    dataset.mean, dataset.std = z["mean"], z["std"]
-    return dataset, SplitIndices(train=z["train"], val=z["val"], test=z["test"])
+    dataset.mean, dataset.std = np.asarray(load("mean")), np.asarray(load("std"))
+    return dataset, SplitIndices(
+        train=np.asarray(load("train")), val=np.asarray(load("val")), test=np.asarray(load("test"))
+    )
+
+
+# ---------------------------------------------------------------------------
+def _train_group_worker(
+    snapshot_path: str,
+    member_ids: list[int],
+    seeds: list[int],
+    gpu_id: int | None,
+    model_config: dict,
+    trainer_config: dict,
+    ensemble_config: dict,
+    output_dir: str,
+    run_name: str,
+) -> list[dict]:
+    """Train a whole group of members together, vectorized, on one GPU."""
+    import os
+
+    for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
+        os.environ.setdefault(var, "1")
+
+    import torch as _torch
+
+    from .vectorized import VectorizedConfig, VectorizedEnsembleTrainer
+
+    dataset, splits = _load_snapshot(snapshot_path)
+    tconf = TrainerConfig(**trainer_config)
+    econf = EnsembleConfig(**ensemble_config)
+    device = f"cuda:{gpu_id}" if (gpu_id is not None and _torch.cuda.is_available()) else "cpu"
+    _torch.set_float32_matmul_precision(tconf.matmul_precision)
+
+    vconf = VectorizedConfig(
+        batch_size=tconf.batch_size,
+        val_batch_size=tconf.val_batch_size,
+        learning_rate=tconf.learning_rate,
+        momentum=tconf.momentum,
+        weight_decay=tconf.weight_decay,
+        optimizer=tconf.optimizer,
+        max_epochs=tconf.max_epochs,
+        early_stopping_patience=tconf.early_stopping_patience,
+        scheduler_t0=model_config.get("scheduler_t0", 25),
+        scheduler_t_mult=model_config.get("scheduler_t_mult", 1),
+        scheduler_eta_min=model_config.get("scheduler_eta_min", 1e-8),
+        compile=tconf.compile,
+        amp_dtype="bf16" if tconf.precision.startswith("bf16") else "none",
+    )
+    trainer = VectorizedEnsembleTrainer(
+        config=vconf, output_dir=output_dir, run_name=run_name, device=device
+    )
+    return trainer.train(
+        dataset,
+        splits,
+        member_ids=list(member_ids),
+        seeds=list(seeds),
+        bootstrap=econf.bootstrap,
+        bootstrap_fraction=econf.bootstrap_fraction,
+        model_config=ModelConfig(**model_config),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -149,6 +232,8 @@ class CARLEnsemble:
         self.run_name = run_name
         self.models: list[CARL] = []
         self.manifest: dict = {}
+        self._stacked = None
+        self._stacked_device: str | None = None
 
     @property
     def manifest_path(self) -> Path:
@@ -158,17 +243,15 @@ class CARLEnsemble:
     def train(self, dataset: NSBIDataset, splits: SplitIndices) -> list[dict]:
         cfg = self.config
         member_ids = list(range(cfg.start_member, cfg.n_members))
-        gpus = self.trainer.config.gpus or [None]
-        gpu_slots = [g for g in gpus for _ in range(cfg.workers_per_gpu)]
-        assignments = [
-            (m, cfg.start_seed + m, gpu_slots[i % len(gpu_slots)]) for i, m in enumerate(member_ids)
-        ]
+        if not member_ids:
+            return self._merge_manifest([])
 
-        snapshot = self.output_dir / f"dataset_snapshot_{self.run_name}.npz"
+        gpus = self.trainer.config.gpus or [None]
+        snapshot = self.output_dir / f"dataset_snapshot_{self.run_name}"
         self.output_dir.mkdir(parents=True, exist_ok=True)
         _save_snapshot(snapshot, dataset, splits)
 
-        worker_args = dict(
+        common = dict(
             snapshot_path=str(snapshot),
             model_config=asdict(self.trainer.model_config),
             trainer_config={**asdict(self.trainer.config), "gpus": []},
@@ -177,24 +260,77 @@ class CARLEnsemble:
             run_name=self.run_name,
         )
 
-        max_workers = min(len(assignments), len(gpu_slots))
-        if max_workers <= 1:
-            summaries = [
-                _train_member_worker(member_id=m, seed=s, gpu_id=g, **worker_args)
-                for m, s, g in assignments
-            ]
+        if cfg.mode == "vectorized":
+            summaries = self._train_vectorized(member_ids, gpus, common)
         else:
-            ctx = torch.multiprocessing.get_context("spawn")
-            with ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as pool:
-                futures = [
-                    pool.submit(_train_member_worker, member_id=m, seed=s, gpu_id=g, **worker_args)
-                    for m, s, g in assignments
-                ]
-                summaries = [f.result() for f in futures]
+            summaries = self._train_process_pool(member_ids, gpus, common)
 
         summaries = self._merge_manifest(summaries)
         self.load()  # load all trained members for inference
         return summaries
+
+    # ------------------------------------------------------------------
+    def _groups(self, member_ids: list[int], gpus: list) -> list[tuple[list[int], object]]:
+        """Split the members into one group per GPU (or smaller groups).
+
+        One group == one process == one stacked model. Members inside a group
+        train simultaneously; groups run in parallel across GPUs.
+        """
+        cfg = self.config
+        per_gpu: list[list[int]] = [[] for _ in gpus]
+        for i, m in enumerate(member_ids):
+            per_gpu[i % len(gpus)].append(m)
+
+        groups: list[tuple[list[int], object]] = []
+        for gpu, members in zip(gpus, per_gpu):
+            if not members:
+                continue
+            size = cfg.members_per_group or len(members)
+            for s in range(0, len(members), size):
+                groups.append((members[s : s + size], gpu))
+        return groups
+
+    def _train_vectorized(self, member_ids: list[int], gpus: list, common: dict) -> list[dict]:
+        cfg = self.config
+        groups = self._groups(member_ids, gpus)
+        jobs = [
+            (members, [cfg.start_seed + m for m in members], gpu) for members, gpu in groups
+        ]
+
+        if len(jobs) <= 1:
+            members, seeds, gpu = jobs[0]
+            return _train_group_worker(member_ids=members, seeds=seeds, gpu_id=gpu, **common)
+
+        ctx = torch.multiprocessing.get_context("spawn")
+        with ProcessPoolExecutor(max_workers=len(jobs), mp_context=ctx) as pool:
+            futures = [
+                pool.submit(_train_group_worker, member_ids=m, seeds=s, gpu_id=g, **common)
+                for m, s, g in jobs
+            ]
+            out: list[dict] = []
+            for f in futures:
+                out.extend(f.result())
+        return out
+
+    def _train_process_pool(self, member_ids: list[int], gpus: list, common: dict) -> list[dict]:
+        cfg = self.config
+        gpu_slots = [g for g in gpus for _ in range(cfg.workers_per_gpu)]
+        assignments = [
+            (m, cfg.start_seed + m, gpu_slots[i % len(gpu_slots)]) for i, m in enumerate(member_ids)
+        ]
+        max_workers = min(len(assignments), len(gpu_slots))
+        if max_workers <= 1:
+            return [
+                _train_member_worker(member_id=m, seed=s, gpu_id=g, **common)
+                for m, s, g in assignments
+            ]
+        ctx = torch.multiprocessing.get_context("spawn")
+        with ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as pool:
+            futures = [
+                pool.submit(_train_member_worker, member_id=m, seed=s, gpu_id=g, **common)
+                for m, s, g in assignments
+            ]
+            return [f.result() for f in futures]
 
     def _merge_manifest(self, new_summaries: list[dict]) -> list[dict]:
         members: dict[int, dict] = {}
@@ -216,16 +352,32 @@ class CARLEnsemble:
             CARL.load_from_checkpoint(m["checkpoint"], map_location=map_location)
             for m in self.manifest["members"]
         ]
+        self._stacked, self._stacked_device = None, None
         return self
 
     @torch.no_grad()
     def member_predictions(self, x: torch.Tensor | np.ndarray, device: str | None = None,
-                           batch_size: int = 4096) -> np.ndarray:
-        """(n_members, n_events) matrix of member scores for SCALED features."""
+                           batch_size: int = 262144, stacked: bool = True) -> np.ndarray:
+        """(n_members, n_events) matrix of member scores for SCALED features.
+
+        With ``stacked`` (the default) the members are fused into a single
+        batched module and every member is evaluated in the same pass, which
+        is what the likelihood scan wants: it turns M sequential sweeps over
+        the events into one. The per-model loop is kept as a fallback.
+        """
         if not self.models:
             self.load()
         device = device or ("cuda:0" if torch.cuda.is_available() else "cpu")
         x = torch.as_tensor(x, dtype=torch.float32)
+
+        if stacked and len(self.models) > 1:
+            model = self.stacked(device=device)
+            out = [
+                torch.sigmoid(model(x[i : i + batch_size].to(device))).cpu()
+                for i in range(0, len(x), batch_size)
+            ]
+            return torch.cat(out, dim=1).numpy()
+
         preds = []
         for model in self.models:
             model = model.to(device).eval()
@@ -233,6 +385,35 @@ class CARLEnsemble:
             preds.append(torch.cat(out).numpy())
             model.to("cpu")
         return np.stack(preds)
+
+    def stacked(self, device: str | torch.device = "cpu"):
+        """Fuse the loaded members into one :class:`StackedMLP` for inference."""
+        from .vectorized import StackedMLP
+
+        if self._stacked is not None and self._stacked_device == str(device):
+            return self._stacked
+        if not self.models:
+            self.load()
+
+        hp = self.models[0].hparams
+        model = StackedMLP(
+            n_members=len(self.models),
+            n_features=hp["n_features"],
+            n_layers=hp["n_layers"],
+            n_nodes=hp["n_nodes"],
+            dropout=hp.get("dropout", 0.0),
+        )
+        stride = 3 if hp.get("dropout", 0.0) > 0.0 else 2
+        with torch.no_grad():
+            for m, member in enumerate(self.models):
+                sd = member.state_dict()
+                for layer in range(len(model.weights)):
+                    idx = layer * stride
+                    model.weights[layer][m].copy_(sd[f"net.{idx}.weight"].t())
+                    model.biases[layer][m, 0].copy_(sd[f"net.{idx}.bias"])
+        model = model.to(device).eval()
+        self._stacked, self._stacked_device = model, str(device)
+        return model
 
     def inference(self, x: torch.Tensor | np.ndarray, device: str | None = None) -> np.ndarray:
         """Ensembled output: average of all member predictions."""

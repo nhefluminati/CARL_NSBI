@@ -86,10 +86,37 @@ CalibrationCurvePlot(n_bins=40).plot(EvaluationContext(scores=s, labels=y, weigh
 
 ## Ensembles
 
-`CARLEnsemble` reuses `CARLTrainer` per member, trains members in parallel
-(round-robin over `training.gpus`, `workers_per_gpu` each, spawn-safe via an
-.npz dataset snapshot), with member `i` seeded `start_seed + i`. Resume /
-extend with `start_member`. Afterwards:
+`CARLEnsemble` trains the members in one of two modes, set by `ensemble.mode`.
+
+**`vectorized` (default).** All members assigned to a GPU are stacked into a
+single module whose weights carry a leading member axis, so one batched
+matmul trains all of them:
+
+```
+x (M, B, F)  @  W (M, F, H)  ->  (M, B, H)
+```
+
+Members stay mathematically independent — their parameters are disjoint
+slices, so summing the per-member losses gives each exactly the gradient it
+would have had alone — and member `i` still initialises from `start_seed + i`
+and still trains on its own bootstrap resample. Each member gets its own
+early-stopping counter and its own best-weight snapshot, and is written out as
+an ordinary Lightning checkpoint that `CARL.load_from_checkpoint` reads.
+
+This matters because a CARL network here is tiny. On a modern GPU a 5x256 net
+on a handful of features cannot fill the device, so wall time is dominated by
+kernel-launch overhead rather than arithmetic. Stacking raises the work per
+launch by a factor M while leaving the launch count unchanged.
+
+**`process`.** The original path: one member per process, round-robin over
+`training.gpus` with `workers_per_gpu` each. Kept as a fallback.
+
+With multiple GPUs the members are split across them and each GPU trains its
+group vectorized, which is strictly better than DDP for this workload — DDP
+parallelises a single tiny network, and the gradient all-reduce costs more
+than the gradient it synchronises.
+
+Resume / extend with `start_member`. Afterwards:
 
 ```python
 result = Pipeline.from_yaml("configs/example.yaml").run()
@@ -97,9 +124,40 @@ ensemble = result["ensemble"]
 scores = ensemble.inference(x_scaled)   # average over members
 ```
 
+Inference stacks the members too, so the likelihood scan evaluates all of them
+in one pass over the events instead of M sequential sweeps.
+
 The final evaluation phase runs once for the whole ensemble on the test
 split; contexts then also carry the full `(n_members, n_events)` prediction
 matrix.
+
+## Performance
+
+The `performance:` block in the config holds the knobs; the defaults are the
+fast ones. The changes that matter, in order of size:
+
+| Change | Why |
+| --- | --- |
+| `device_batches: true` | The splits are uploaded to the GPU once and batched by tensor slicing. The default `DataLoader(Subset(...))` path makes one Python `__getitem__` call per **event** per epoch, then collates, then (with workers) pickles each batch through a queue — for a 10M-event split that is ~10M Python calls per epoch to feed two matmuls. |
+| `ensemble.mode: vectorized` | M members per kernel launch instead of one (see above). |
+| `batch_size` | 512 leaves the GPU idle. 32k+ is the right order for this model size. Scale the learning rate with it, or use `optimizer: adamw`. |
+| Validation accumulators | `val_loss` is accumulated as two device scalars and reduced with one two-element collective. Previously every validation feature, label, weight and logit was copied to the CPU every epoch, and under DDP the full feature matrix was `all_gather`-ed. The full arrays are now only materialised on epochs where a diagnostic is actually due. |
+| `matmul_precision: high` | TF32 on the tensor cores. |
+| `save_last: false` | `last.ckpt` was being rewritten every epoch. |
+| `.npy` snapshot | The ensemble dataset snapshot is memory-mapped instead of being parsed into a private copy per worker. |
+
+Measure it on your own data and hardware:
+
+```
+python -m nsbi_carl.benchmark --events 2000000 --members 8 --epochs 5
+```
+
+It times the old DataLoader path, device batching, and the vectorized
+ensemble against each other on synthetic data of the shape you give it.
+
+`tests/smoke_test.py` runs both ensemble modes and the single-network path
+end to end on synthetic `.h5` inputs and checks that stacked inference agrees
+with the per-model loop.
 
 ## Programmatic use
 

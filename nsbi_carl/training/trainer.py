@@ -16,9 +16,11 @@ import lightning as L
 import numpy as np
 import torch
 from lightning.pytorch.callbacks import Callback, EarlyStopping, ModelCheckpoint
+from lightning.pytorch.strategies import DDPStrategy
 from torch.utils.data import DataLoader, Subset
 
 from ..data.dataset import NSBIDataset, SplitIndices
+from ..data.fastloader import DeviceBatches, resolve_device
 from ..evaluation.base import EvaluationContext, EvaluationSuite
 from ..model import CARL
 
@@ -35,6 +37,17 @@ class TrainerConfig:
     gpus: list[int] = field(default_factory=list)  # empty -> CPU
     precision: str = "32-true"
     resume_from: str | None = None                  # checkpoint path to continue from
+
+    # -- performance knobs (see configs/example.yaml) --------------------
+    device_batches: bool = True       # keep the split on the GPU, skip DataLoader
+    matmul_precision: str = "high"    # "highest" | "high" | "medium"  (TF32)
+    compile: bool = False             # torch.compile the network
+    optimizer: str = "sgd"            # "sgd" | "adam" | "adamw"
+    weight_decay: float = 0.0
+    save_last: bool = False           # writing last.ckpt every epoch is pure IO
+    checkpoint_every_n_epochs: int = 1
+    progress_bar: bool = True
+    log_every_n_steps: int = 50
 
 
 @dataclass
@@ -91,12 +104,42 @@ class CARLTrainer:
             scheduler_t0=mc.scheduler_t0,
             scheduler_t_mult=mc.scheduler_t_mult,
             scheduler_eta_min=mc.scheduler_eta_min,
+            optimizer=self.config.optimizer,
+            weight_decay=self.config.weight_decay,
         )
 
     def make_loaders(
-        self, dataset: NSBIDataset, train_idx: np.ndarray, val_idx: np.ndarray
-    ) -> tuple[DataLoader, DataLoader]:
-        common = dict(num_workers=self.config.num_workers, pin_memory=torch.cuda.is_available())
+        self, dataset: NSBIDataset, train_idx: np.ndarray, val_idx: np.ndarray, seed: int = 0
+    ):
+        """Batch iterators for train and validation.
+
+        With ``device_batches`` (the default) the two splits are uploaded to
+        the GPU once and batched by tensor slicing — for tabular data this is
+        the single biggest win available, because the default DataLoader path
+        makes one Python ``__getitem__`` call per *event* and then collates,
+        which for these datasets costs far more than the network itself.
+        """
+        if self.config.device_batches:
+            device = resolve_device(self.config.gpus)
+            world_size = len(self.config.gpus) if len(self.config.gpus) > 1 else 1
+            rank = 0
+            if world_size > 1 and torch.distributed.is_available() and torch.distributed.is_initialized():
+                rank = torch.distributed.get_rank()
+                device = torch.device(f"cuda:{self.config.gpus[rank]}")
+            common = dict(device=device, rank=rank, world_size=world_size, seed=seed)
+            train_loader = DeviceBatches(
+                dataset, train_idx, self.config.batch_size, shuffle=True, drop_last=True, **common
+            )
+            val_loader = DeviceBatches(
+                dataset, val_idx, self.config.val_batch_size, shuffle=False, drop_last=False, **common
+            )
+            return train_loader, val_loader
+
+        common = dict(
+            num_workers=self.config.num_workers,
+            pin_memory=torch.cuda.is_available(),
+            persistent_workers=self.config.num_workers > 0,
+        )
         train_loader = DataLoader(
             Subset(dataset, train_idx.tolist()), batch_size=self.config.batch_size, shuffle=True, **common
         )
@@ -113,7 +156,8 @@ class CARLTrainer:
                 monitor="val_loss",
                 mode="min",
                 save_top_k=1,
-                save_last=True,
+                save_last=self.config.save_last,
+                every_n_epochs=self.config.checkpoint_every_n_epochs,
                 dirpath=checkpoint_dir,
                 filename=f"best_{tag}",
             ),
@@ -127,16 +171,31 @@ class CARLTrainer:
         ]
         gpus = self.config.gpus
         use_gpu = torch.cuda.is_available() and len(gpus) > 0
+
+        strategy = "auto"
+        if use_gpu and len(gpus) > 1:
+            # For a network this small the gradient all-reduce is a real cost,
+            # so: no unused-parameter scan, a static graph (lets DDP fuse and
+            # reuse its buckets), and gradients viewed directly in the bucket
+            # instead of copied into it.
+            strategy = DDPStrategy(
+                find_unused_parameters=False,
+                static_graph=True,
+                gradient_as_bucket_view=True,
+            )
+
         trainer = L.Trainer(
             max_epochs=self.config.max_epochs,
             accelerator="gpu" if use_gpu else "cpu",
             devices=gpus if use_gpu else 1,
-            strategy="ddp" if use_gpu and len(gpus) > 1 else "auto",
+            strategy=strategy,
             precision=self.config.precision,
             callbacks=callbacks,
             logger=False,
-            enable_progress_bar=True,
+            enable_progress_bar=self.config.progress_bar,
+            enable_model_summary=False,
             num_sanity_val_steps=0,
+            log_every_n_steps=self.config.log_every_n_steps,
         )
         return trainer, history
 
@@ -160,7 +219,9 @@ class CARLTrainer:
             self.config.gpus = gpus_override
 
         L.seed_everything(seed, workers=True)
-        torch.set_float32_matmul_precision("medium")
+        # TF32 on the tensor cores: for fp32 MLPs this is close to free speed.
+        torch.set_float32_matmul_precision(self.config.matmul_precision)
+        torch.backends.cudnn.benchmark = True
 
         model = self.build_model(dataset.n_features)
         model.evaluation = self.training_evaluation
@@ -168,9 +229,11 @@ class CARLTrainer:
         model.feature_names = dataset.feature_names
         model.scaler_mean = dataset.mean
         model.scaler_std = dataset.std
+        if self.config.compile:
+            model.net = torch.compile(model.net, dynamic=False)
 
         train_loader, val_loader = self.make_loaders(
-            dataset, splits.train if train_idx is None else train_idx, splits.val
+            dataset, splits.train if train_idx is None else train_idx, splits.val, seed=seed
         )
         checkpoint_dir = self.output_dir / tag / "checkpoints"
         trainer, history = self._lightning_trainer(checkpoint_dir, tag)
@@ -194,10 +257,17 @@ class CARLTrainer:
     # ------------------------------------------------------------------
     @torch.no_grad()
     def predict(self, model: CARL, dataset: NSBIDataset, idx: np.ndarray, device: str | None = None) -> np.ndarray:
+        """Score events by slicing device tensors — no DataLoader, no collate."""
         device = device or ("cuda:0" if torch.cuda.is_available() and self.config.gpus else "cpu")
         model = model.to(device).eval()
-        loader = DataLoader(Subset(dataset, idx.tolist()), batch_size=self.config.val_batch_size, shuffle=False)
-        return np.concatenate([model(x.to(device)).flatten().cpu().numpy() for x, _, _ in loader])
+        sel = torch.as_tensor(np.asarray(idx, dtype=np.int64))
+        x = dataset.x.index_select(0, sel)
+        bs = max(1, self.config.val_batch_size)
+        out = [
+            model(x[i : i + bs].to(device, non_blocking=True)).flatten().cpu()
+            for i in range(0, x.shape[0], bs)
+        ]
+        return torch.cat(out).numpy() if out else np.zeros(0, dtype=np.float32)
 
     def evaluate(
         self,
@@ -224,6 +294,8 @@ class CARLTrainer:
         )
         results = (suite or self.final_evaluation).run(ctx)
         if results:
-            with open(self.output_dir / "evaluation" / f"metrics_{tag}.json", "w") as f:
+            eval_dir = self.output_dir / "evaluation"
+            eval_dir.mkdir(parents=True, exist_ok=True)
+            with open(eval_dir / f"metrics_{tag}.json", "w") as f:
                 json.dump(results, f, indent=2)
         return results
