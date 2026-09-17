@@ -39,6 +39,8 @@ class EnsembleConfig:
     start_seed: int = 100
     bootstrap: bool = True
     bootstrap_fraction: float = 1.0
+    bootstrap_reference: bool = False  # resample the reference too (off: every
+                                       # member shares the identical reference)
     workers_per_gpu: int = 1
     start_member: int = 0  # resume an ensemble by training only members >= this
 
@@ -51,22 +53,46 @@ class EnsembleConfig:
 
 
 def bootstrap_train_indices(
-    splits: SplitIndices, labels: np.ndarray, seed: int, fraction: float
+    splits: SplitIndices,
+    labels: np.ndarray,
+    seed: int,
+    fraction: float,
+    bootstrap_reference: bool = False,
 ) -> np.ndarray:
-    """Bootstrap-resample the train split, target and reference separately.
+    """Bootstrap-resample the train split — by default the TARGET only.
 
-    Separate, name-seeded generators keep the reference draws independent of
-    the target sample — the same guarantee the splitter gives.
+    Every CARL network in the analysis is trained against the same reference,
+    so the ensemble spread is meant to capture the statistical uncertainty of
+    the target sample, not of the reference. Resampling the reference as well
+    would make each member see a different denominator, and the ratios of
+    different templates' outputs (which is what the likelihood actually uses)
+    would inherit that mismatch. So the reference train split is passed
+    through whole and unchanged: every member of every process trains on the
+    numerically identical reference events.
+
+    ``bootstrap_reference=True`` restores the old behaviour, in which the
+    reference is resampled too with its own name-seeded generator.
+
+    The reference events always occupy the tail of the returned array in
+    their original order, so two members built from the same splits share
+    byte-identical reference rows.
     """
     train = splits.train
     tgt = train[labels[train] == 1.0]
     ref = train[labels[train] == 0.0]
+
     rng_t = np.random.default_rng([seed, zlib.crc32(b"target")])
-    rng_r = np.random.default_rng([seed, zlib.crc32(b"reference")])
     n_t = max(1, int(round(fraction * len(tgt))))
-    n_r = max(1, int(round(fraction * len(ref))))
-    out = np.concatenate([rng_t.choice(tgt, n_t, replace=True), rng_r.choice(ref, n_r, replace=True)])
-    return np.random.default_rng(seed).permutation(out)
+    tgt_out = rng_t.choice(tgt, n_t, replace=True)
+
+    if bootstrap_reference:
+        rng_r = np.random.default_rng([seed, zlib.crc32(b"reference")])
+        n_r = max(1, int(round(fraction * len(ref))))
+        ref_out = rng_r.choice(ref, n_r, replace=True)
+    else:
+        ref_out = ref  # identical for every member, in a fixed order
+
+    return np.concatenate([tgt_out, ref_out])
 
 
 # ---------------------------------------------------------------------------
@@ -103,7 +129,9 @@ def _train_member_worker(
     econf = EnsembleConfig(**ensemble_config)
     labels = dataset.y.numpy().reshape(-1)
     train_idx = (
-        bootstrap_train_indices(splits, labels, seed, econf.bootstrap_fraction)
+        bootstrap_train_indices(
+            splits, labels, seed, econf.bootstrap_fraction, econf.bootstrap_reference
+        )
         if econf.bootstrap
         else splits.train
     )
@@ -213,6 +241,7 @@ def _train_group_worker(
         seeds=list(seeds),
         bootstrap=econf.bootstrap,
         bootstrap_fraction=econf.bootstrap_fraction,
+        bootstrap_reference=econf.bootstrap_reference,
         model_config=ModelConfig(**model_config),
     )
 

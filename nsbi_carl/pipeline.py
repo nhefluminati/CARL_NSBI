@@ -17,10 +17,10 @@ from pathlib import Path
 
 from .config import RunRecord, load_config
 from .data.dataset import NSBIDataset, SplitIndices
-from .data.loading import DatasetBuilder
+from .data.loading import DatasetBuilder, save_reference_cache
 from .data.reweighting import ReweightStep
 from .data.scaling import StandardScalerStep
-from .data.splitting import SplitStep
+from .data.splitting import SplitStep, reference_fingerprint
 from .evaluation import base as _eval_base
 from .evaluation import metrics as _metrics  # noqa: F401  (populate registries)
 from .evaluation import plots as _plots      # noqa: F401
@@ -42,9 +42,12 @@ class Pipeline:
         data_cfg = config["data"]
         self.dataset_builder = DatasetBuilder(
             target_paths=data_cfg["target_paths"],
-            reference_paths=data_cfg["reference_paths"],
+            reference_paths=data_cfg.get("reference_paths", []) or [],
             features=data_cfg["features"],
             weight_key=data_cfg.get("weight_key", "weight"),
+            absolute_weights=data_cfg.get("absolute_weights", False),
+            load_reference=data_cfg.get("load_reference"),
+            save_reference=data_cfg.get("save_reference"),
         )
         split_cfg = config.get("split", {})
         self.split_step = SplitStep(
@@ -52,7 +55,9 @@ class Pipeline:
             val_fraction=split_cfg.get("val_fraction", 0.1),
             seed=self.seed,
         )
-        self.reweight_step = ReweightStep()
+        self.reweight_step = ReweightStep(
+            reference_unit_weights=data_cfg.get("reference_unit_weights", True)
+        )
         self.scaler_step = StandardScalerStep()
 
         model_cfg = config.get("model", {})
@@ -105,6 +110,7 @@ class Pipeline:
                     start_seed=ens_cfg.get("start_seed", self.seed),
                     bootstrap=ens_cfg.get("bootstrap", True),
                     bootstrap_fraction=ens_cfg.get("bootstrap_fraction", 1.0),
+                    bootstrap_reference=ens_cfg.get("bootstrap_reference", False),
                     workers_per_gpu=ens_cfg.get("workers_per_gpu", 1),
                     start_member=ens_cfg.get("start_member", 0),
                     mode=ens_cfg.get("mode", "vectorized"),
@@ -146,6 +152,25 @@ class Pipeline:
                 "n_test": len(splits.test),
             }
         )
+
+        # The reference is the common denominator of every template's network,
+        # so record a hash of it. Two runs agreeing on these digests trained
+        # against byte-identical reference events.
+        self.record.update(reference_fingerprint=reference_fingerprint(dataset, splits))
+
+        # Saved before reweighting: the stored weights are the ones read from
+        # the inputs (with |w| applied if configured). The reweighting is
+        # relative to the target yield and so is recomputed every run.
+        if self.dataset_builder.save_reference:
+            self.record.update(
+                reference_cache_written=save_reference_cache(
+                    self.dataset_builder.save_reference,
+                    dataset,
+                    self.dataset_builder.absolute_weights,
+                )
+            )
+        if self.dataset_builder.load_reference:
+            self.record.update(reference_cache_loaded=self.dataset_builder.load_reference)
 
         self.record.update(reweighting=self.reweight_step.apply(dataset, splits))
         self.record.update(preprocessing=self.scaler_step.apply(dataset, splits))

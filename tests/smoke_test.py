@@ -91,6 +91,32 @@ def main():
         assert result["summaries"][0]["val_loss"], "no val loss recorded"
         print("[ok] single-network path with device batching")
 
+        # --- shared reference across two templates -----------------------
+        import yaml as _yaml
+
+        cache = tmp / "reference_sample.h5"
+        cfg = build_config(tmp, "sbi", ensemble=False)
+        cfg["data"]["save_reference"] = str(cache)
+        Pipeline(cfg).run()
+        assert cache.exists(), "reference cache not written"
+
+        prints = []
+        for tag, target in (("tmpl_a", "target.h5"), ("tmpl_b", "target2.h5")):
+            make_h5(tmp / "data" / "target2.h5", 9000, 1.3, 77)
+            cfg = build_config(tmp, tag, ensemble=False)
+            cfg["data"]["target_paths"] = [str(tmp / "data" / target)]
+            cfg["data"]["reference_paths"] = []
+            cfg["data"]["load_reference"] = str(cache)
+            cfg["seed"] = 7 if tag == "tmpl_b" else 52   # deliberately different
+            Pipeline(cfg).run()
+            record = _yaml.safe_load(open(tmp / f"out_{tag}" / f"run_config_smoke_{tag}.yaml"))
+            prints.append(record["reference_fingerprint"])
+
+        assert prints[0] == prints[1], f"templates disagree on the reference: {prints}"
+        assert prints[0]["train_n"] > 0
+        print(f"[ok] two templates with different targets AND seeds share one reference "
+              f"(train sha1 {prints[0]['train_sha1'][:12]}..., {prints[0]['train_n']} events)")
+
         print("\nALL CHECKS PASSED")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)

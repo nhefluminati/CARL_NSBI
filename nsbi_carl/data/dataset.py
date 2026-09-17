@@ -38,6 +38,7 @@ class NSBIDataset(Dataset):
         sample_id: np.ndarray,
         sample_names: list[str],
         feature_names: list[str],
+        split_label: np.ndarray | None = None,
     ):
         self.x = torch.as_tensor(x, dtype=torch.float32)
         self.y = torch.as_tensor(y, dtype=torch.float32).reshape(-1, 1)
@@ -45,6 +46,15 @@ class NSBIDataset(Dataset):
         self.sample_id = np.asarray(sample_id, dtype=np.int64)
         self.sample_names = list(sample_names)
         self.feature_names = list(feature_names)
+
+        # Per-event split assignment: 0 = train, 1 = val, 2 = test, -1 = not
+        # yet assigned (the usual case; SplitStep then draws it). Events that
+        # arrive with a label keep it — this is how a reference sample loaded
+        # from a cache file carries its original split across runs.
+        if split_label is None:
+            self.split_label = np.full(len(self.sample_id), -1, dtype=np.int8)
+        else:
+            self.split_label = np.asarray(split_label, dtype=np.int8)
 
         # Filled by the preprocessing step:
         self.mean: np.ndarray | None = None

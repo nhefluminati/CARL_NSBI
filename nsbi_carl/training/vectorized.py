@@ -141,20 +141,42 @@ class VectorizedConfig:
 
 
 def _member_bootstrap_matrix(
-    splits: SplitIndices, labels: np.ndarray, seeds: list[int], fraction: float, bootstrap: bool
+    splits: SplitIndices,
+    labels: np.ndarray,
+    seeds: list[int],
+    fraction: float,
+    bootstrap: bool,
+    bootstrap_reference: bool = False,
 ) -> np.ndarray:
     """``(M, n_train)`` index matrix, one bootstrap resample per member.
 
     Reuses the exact draw logic of ``ensemble.bootstrap_train_indices`` so the
-    vectorized path and the process-pool path see identical data.
+    vectorized path and the process-pool path see identical data. With the
+    default (target-only) bootstrap every row has the same length, and the
+    reference block is identical across rows — asserted below, because a
+    silent mismatch there would bias every ratio the likelihood forms.
     """
     from .ensemble import bootstrap_train_indices
 
     if not bootstrap:
         return np.tile(splits.train[None, :], (len(seeds), 1))
-    rows = [bootstrap_train_indices(splits, labels, s, fraction) for s in seeds]
+
+    rows = [
+        bootstrap_train_indices(splits, labels, s, fraction, bootstrap_reference) for s in seeds
+    ]
     width = min(len(r) for r in rows)
-    return np.stack([r[:width] for r in rows])
+    matrix = np.stack([r[:width] for r in rows])
+
+    if not bootstrap_reference and len(rows) > 1:
+        n_ref = int((labels[splits.train] == 0.0).sum())
+        if n_ref:
+            ref_block = matrix[:, -n_ref:]
+            if not np.array_equal(ref_block, np.broadcast_to(ref_block[0], ref_block.shape)):
+                raise RuntimeError(
+                    "Members disagree on the reference training events; the ensemble would "
+                    "not share a common denominator."
+                )
+    return matrix
 
 
 class VectorizedEnsembleTrainer:
@@ -204,6 +226,7 @@ class VectorizedEnsembleTrainer:
         seeds: list[int],
         bootstrap: bool = True,
         bootstrap_fraction: float = 1.0,
+        bootstrap_reference: bool = False,
         model_config=None,
     ) -> list[dict]:
         cfg = self.config
@@ -215,7 +238,9 @@ class VectorizedEnsembleTrainer:
         dropout = getattr(model_config, "dropout", 0.0)
 
         labels = dataset.y.numpy().reshape(-1)
-        boot = _member_bootstrap_matrix(splits, labels, seeds, bootstrap_fraction, bootstrap)
+        boot = _member_bootstrap_matrix(
+            splits, labels, seeds, bootstrap_fraction, bootstrap, bootstrap_reference
+        )
         boot_t = torch.as_tensor(boot, dtype=torch.long, device=dev)
         n_train = boot_t.shape[1]
 

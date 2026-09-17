@@ -40,9 +40,64 @@ per-reference-sample scales, the target balance scale, split sizes, seeds.
 - The split is drawn per sample with a generator seeded by
   `(seed, crc32(sample_name))`: for the same seed, the same events are pulled
   from a reference sample regardless of which target samples are present.
-  Ensemble bootstraps resample target/reference with separate generators for
-  the same reason.
 - The scaler is fitted on the train split only and applied everywhere.
+
+## Keeping the reference sample fixed
+
+Every template network (S, B, SBI, qq, SBI_EW) is trained against the same
+reference, so the likelihood works with ratios of their outputs. Any
+difference in the reference between two of those trainings biases those
+ratios directly. Four mechanisms keep it pinned:
+
+1. **Split independence.** The per-sample draw depends only on the sample's
+   own name, its own event count and the seed — never on which target is in
+   the run, or how many events the target has.
+2. **Target-only bootstrap.** `ensemble.bootstrap_reference: false` (the
+   default) resamples only the target per member; every member trains on the
+   identical, complete reference train split, in a fixed order. The ensemble
+   spread then reflects target statistics, which is what it is meant to
+   measure. Set it to `true` for the old behaviour.
+3. **`data.save_reference`.** Writes the constructed reference events *and
+   their train/val/test assignment* to one `.h5`. Written after splitting but
+   before reweighting, since the reweighting is relative to the target yield
+   and must be recomputed per run.
+4. **`data.load_reference`.** Builds the reference from that file instead of
+   from `reference_paths`, keeping it fixed even if the seed, the split
+   fractions or the reference inputs change. A mismatched feature list (or
+   merely a permuted one) is rejected rather than silently applied.
+
+The intended workflow is to build the reference once, then point every
+template's config at it:
+
+```yaml
+# build_reference.yaml — run once
+data: {save_reference: data/reference_sample.h5, ...}
+
+# S.yaml, B.yaml, SBI.yaml, qq.yaml, SBI_EW.yaml
+data: {load_reference: data/reference_sample.h5, reference_paths: [], ...}
+```
+
+Each run records a `reference_fingerprint` in its run record: a hash of the
+actual reference events per split, independent of shuffle order and of how
+many target events sit ahead of them. Two runs agreeing on those digests
+trained against byte-identical reference data — which makes the guarantee
+checkable after the fact rather than merely intended.
+
+### Weights
+
+`data.absolute_weights: true` replaces the reference weights with `|w|`, and
+only the reference — target weights keep their sign. Negative MC weights
+enter a weighted BCE with the wrong sign and can drive the loss unbounded
+below.
+
+`data.reference_unit_weights` (default `true`) overwrites every reference
+weight with 1 before the samples are equalized, building a synthetic
+reference with the desired domain. **While it is on, `absolute_weights` has
+no observable effect**, because the weights it would fix are discarded
+immediately afterwards. Turn it off to train against the reference sample's
+own weights.
+
+`tests/reference_test.py` checks all of the above.
 
 ## Model
 
