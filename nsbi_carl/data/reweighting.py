@@ -7,10 +7,21 @@ Three stages, executed in this order (the order matters):
    therefore contribute the same effective statistics to the training.
 
 2. **Target/reference balancing.** The target weights are multiplied by
-   ``w_reference_train.sum() / w_target_train.sum()`` where the sums run over
-   the TRAIN split only. The resulting scalar is then applied to *all* target
-   events — train, validation and test — so the validation/test sets use the
-   numerically identical reweighting as the training set.
+   ``target_balance_factor * w_reference_train.sum() / w_target_train.sum()``
+   where the sums run over the TRAIN split only. The resulting scalar is then
+   applied to *all* target events — train, validation and test — so the
+   validation/test sets use the numerically identical reweighting as the
+   training set.
+
+   ``target_balance_factor`` must be 1 for CARL to estimate the right thing:
+   it is the ratio of the total target weight to the total reference weight
+   after balancing, and the classifier's optimum is
+   ``s = w_t p_t / (w_t p_t + w_r p_r)``. Only at 1 does
+   ``r = s/(1-s)`` equal the density ratio ``p_t/p_r``. At any other value the
+   network learns ``factor * p_t/p_r``, and a large factor also drives the
+   loss to ~0 by saturating the output, because the reference then carries a
+   negligible share of the loss. The step warns when the configured value
+   would leave the classes more than 100x apart.
 
 3. **Global normalization** (optional, ``normalize_weights``). One scalar
    applied to every event of both classes, chosen so the mean weight over the
@@ -30,6 +41,8 @@ record YAML.
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 import torch
 
@@ -37,7 +50,18 @@ from .dataset import NSBIDataset, SplitIndices
 
 
 class ReweightStep:
-    def __init__(self, reference_unit_weights: bool = True, normalize_weights: bool = False):
+    def __init__(
+        self,
+        reference_unit_weights: bool = True,
+        normalize_weights: bool = False,
+        target_balance_factor: float = 1.0,
+    ):
+        # Ratio of total target weight to total reference weight after
+        # balancing. 1.0 is the only value for which r = s/(1-s) is the
+        # density ratio; see the module docstring.
+        if target_balance_factor <= 0:
+            raise ValueError("target_balance_factor must be positive.")
+        self.target_balance_factor = float(target_balance_factor)
         # When true, every reference weight is overwritten with 1 before the
         # samples are equalized — an easy way to build a synthetic reference
         # distribution from physics processes with the desired domain.
@@ -63,15 +87,11 @@ class ReweightStep:
         # loop, and measured end to end the loss and gradients move by a few
         # float32 ULP (~2e-7 relative — tests/weights_test.py pins this).
         #
-        # So the gain is conditioning, not a different optimum. With the
-        # yields this pipeline produces by default (the target balance carries
-        # a 1e+6 factor) a large batch drives the running float32 sums to
-        # ~1e5-1e6, where the spacing between representable values starts to
-        # matter relative to an individual term; normalising keeps both sums
-        # near the batch size. If you were hoping this would change how
-        # training behaves, the batch size and learning rate are the knobs
-        # that will — this one mostly buys numerical headroom and weights
-        # that are readable in a log.
+        # So the gain is conditioning, not a different optimum: it keeps the
+        # running float32 sums near the batch size instead of wherever the
+        # sample yields happen to put them, and makes the weights readable in
+        # a log. If you were hoping this would change how training behaves,
+        # the batch size and learning rate are the knobs that will.
         self.normalize_weights = bool(normalize_weights)
 
     def apply(self, dataset: NSBIDataset, splits: SplitIndices) -> dict:
@@ -105,8 +125,22 @@ class ReweightStep:
         if target_train_sum <= 0 or reference_train_sum <= 0:
             raise ValueError("Train split must contain positive target and reference yields.")
 
-        target_scale = float(reference_train_sum * 1e+6 / target_train_sum)
+        target_scale = float(
+            reference_train_sum * self.target_balance_factor / target_train_sum
+        )
         w[y == 1.0] *= target_scale  # identical value applied to train/val/test
+
+        if not 0.01 <= self.target_balance_factor <= 100.0:
+            warnings.warn(
+                f"target_balance_factor={self.target_balance_factor:g} leaves the target and "
+                "reference classes far apart in total weight. The classifier optimum is "
+                "s = w_t.p_t / (w_t.p_t + w_r.p_r), so r = s/(1-s) will estimate "
+                f"{self.target_balance_factor:g} * p_t/p_r, not the density ratio, and the "
+                "loss will fall towards 0 as the output saturates. Use 1.0 unless you are "
+                "deliberately studying this.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
         # -- 3) global normalization (both classes, one scalar) ------------
         # Fixed on the TRAIN split and applied to train/val/test alike, for
@@ -128,6 +162,7 @@ class ReweightStep:
             "reference_sample_scales": reference_scales,
             "reference_unit_weights": self.reference_unit_weights,
             "target_balance_scale": target_scale,
+            "target_balance_factor": self.target_balance_factor,
             "normalize_weights": self.normalize_weights,
             "global_normalization_scale": normalization_scale,
             "train_mean_weight": float(w[train].mean()),

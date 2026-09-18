@@ -139,9 +139,69 @@ def main():
         )
 
         # ... and the normalized run is the better conditioned one, which is
-        # the actual reason to switch it on.
-        assert sums[0] < sums[1], "normalization did not reduce the float32 accumulator"
-        ok.append(f"float32 weight-sum accumulator {sums[1]:.3e} -> {sums[0]:.3e}")
+        # the actual reason to switch it on. The accumulator lands at the
+        # batch size regardless of which side it started on: with a large
+        # balance factor the raw weights are huge, without one they are tiny
+        # (each reference sample sums to 1 over all its events), and either
+        # extreme costs float32 precision.
+        # Tolerance is loose on purpose: the mean weight is 1 over the whole
+        # train split, and this is one 4096-event slice of it, so a sub-percent
+        # fluctuation is expected. The claim being tested is that the
+        # accumulator sits at the batch size rather than decades away from it.
+        n_batch = 4096
+        assert abs(sums[0] - n_batch) / n_batch < 0.05, (
+            f"normalized accumulator {sums[0]:.3e} is not ~the batch size {n_batch}"
+        )
+        drift = abs(np.log10(sums[1] / n_batch))
+        ok.append(
+            f"float32 weight-sum accumulator {sums[1]:.3e} -> {sums[0]:.3e} "
+            f"(~batch size; was {drift:.1f} decades off)"
+        )
+
+        # -- 5) the classes end up balanced, and r recovers p_t/p_r ---------
+        # This is the invariant that matters: CARL's optimum is
+        #   s = w_t p_t / (w_t p_t + w_r p_r)
+        # so r = s/(1-s) is the density ratio ONLY when the two classes carry
+        # equal total weight. A balance factor far from 1 also collapses the
+        # loss towards 0, because the lighter class stops contributing.
+        d3 = build(tmp)
+        s3 = split.split(d3)
+        ReweightStep().apply(d3, s3)
+        w3 = d3.w.numpy().reshape(-1)
+        y3 = d3.y.numpy().reshape(-1)
+        T = w3[s3.train][y3[s3.train] == 1.0].sum()
+        R = w3[s3.train][y3[s3.train] == 0.0].sum()
+        assert abs(T / R - 1.0) < 1e-9, f"classes not balanced: target/reference = {T / R:.3e}"
+        ok.append(f"default balance puts the classes on equal total weight (T/R = {T / R:.6f})")
+
+        # Closed-form check on separable 1-D Gaussians: fit the analytic
+        # optimum and confirm the recovered ratio is p_t/p_r, not a multiple.
+        rng = np.random.default_rng(0)
+        n = 200_000
+        xt, xr = rng.normal(0.5, 1.0, n), rng.normal(0.0, 1.0, n)
+        xs = np.concatenate([xt, xr])
+        ys = np.concatenate([np.ones(n), np.zeros(n)])
+        for factor, expect in ((1.0, 1.0), (50.0, 50.0)):
+            wt = np.where(ys == 1.0, factor, 1.0)
+            # optimal s at each x for these known densities
+            pt = np.exp(-0.5 * (xs - 0.5) ** 2)
+            pr = np.exp(-0.5 * xs**2)
+            s_opt = (factor * pt) / (factor * pt + pr)
+            r = s_opt / (1.0 - s_opt)
+            got = np.median(r / (pt / pr))
+            assert abs(got - expect) / expect < 1e-9, f"factor {factor}: r/(p_t/p_r) = {got}"
+        ok.append("r = s/(1-s) equals p_t/p_r at factor 1, and factor*p_t/p_r otherwise")
+
+        # an extreme factor must warn rather than fail silently
+        import warnings as _w
+
+        with _w.catch_warnings(record=True) as caught:
+            _w.simplefilter("always")
+            d4 = build(tmp)
+            s4 = split.split(d4)
+            ReweightStep(target_balance_factor=1e6).apply(d4, s4)
+        assert any(issubclass(c.category, RuntimeWarning) for c in caught), "no warning raised"
+        ok.append("an extreme target_balance_factor raises a RuntimeWarning")
 
         for line in ok:
             print(f"[ok] {line}")
