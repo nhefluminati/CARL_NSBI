@@ -56,7 +56,8 @@ class Pipeline:
             seed=self.seed,
         )
         self.reweight_step = ReweightStep(
-            reference_unit_weights=data_cfg.get("reference_unit_weights", True)
+            reference_unit_weights=data_cfg.get("reference_unit_weights", True),
+            normalize_weights=data_cfg.get("normalize_weights", False),
         )
         self.scaler_step = StandardScalerStep()
 

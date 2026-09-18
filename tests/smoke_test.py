@@ -117,6 +117,18 @@ def main():
         print(f"[ok] two templates with different targets AND seeds share one reference "
               f"(train sha1 {prints[0]['train_sha1'][:12]}..., {prints[0]['train_n']} events)")
 
+        # --- global weight normalization through the real pipeline --------
+        cfg = build_config(tmp, "norm", ensemble=False)
+        cfg["data"]["normalize_weights"] = True
+        Pipeline(cfg).run()
+        record = _yaml.safe_load(open(tmp / "out_norm" / "run_config_smoke_norm.yaml"))
+        rw = record["reweighting"]
+        assert abs(rw["train_mean_weight"] - 1.0) < 1e-9, rw["train_mean_weight"]
+        assert rw["normalize_weights"] is True
+        print(f"[ok] normalize_weights through the pipeline "
+              f"(scale {rw['global_normalization_scale']:.4g}, train mean weight "
+              f"{rw['train_mean_weight']:.10f})")
+
         print("\nALL CHECKS PASSED")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
