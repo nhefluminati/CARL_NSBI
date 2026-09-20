@@ -21,6 +21,7 @@ from torch.utils.data import DataLoader, Subset
 
 from ..data.dataset import NSBIDataset, SplitIndices
 from ..data.fastloader import DeviceBatches, resolve_device
+from ..data.reweighting import log_weight_summary
 from ..evaluation.base import EvaluationContext, EvaluationSuite
 from ..model import CARL
 
@@ -48,6 +49,7 @@ class TrainerConfig:
     checkpoint_every_n_epochs: int = 1
     progress_bar: bool = True
     log_every_n_steps: int = 50
+    log_weights: bool = True   # per-class weight summary at training start
     # Kill switch for PyTorch's JIT-compiled "native" DSL ops. Those compile a
     # Triton/CUDA shim at runtime and need a C toolchain plus the Python
     # development headers on the compute node; where those are missing they
@@ -114,7 +116,8 @@ class CARLTrainer:
         )
 
     def make_loaders(
-        self, dataset: NSBIDataset, train_idx: np.ndarray, val_idx: np.ndarray, seed: int = 0
+        self, dataset: NSBIDataset, train_idx: np.ndarray, val_idx: np.ndarray, seed: int = 0,
+        target_weight_scale: float = 1.0,
     ):
         """Batch iterators for train and validation.
 
@@ -133,7 +136,8 @@ class CARLTrainer:
                 device = torch.device(f"cuda:{self.config.gpus[rank]}")
             common = dict(device=device, rank=rank, world_size=world_size, seed=seed)
             train_loader = DeviceBatches(
-                dataset, train_idx, self.config.batch_size, shuffle=True, drop_last=True, **common
+                dataset, train_idx, self.config.batch_size, shuffle=True, drop_last=True,
+                target_weight_scale=target_weight_scale, **common
             )
             val_loader = DeviceBatches(
                 dataset, val_idx, self.config.val_batch_size, shuffle=False, drop_last=False, **common
@@ -241,8 +245,29 @@ class CARLTrainer:
         if self.config.compile:
             model.net = torch.compile(model.net, dynamic=False)
 
+        idx = splits.train if train_idx is None else train_idx
+
+        # Restore a 1:1 class balance on this member's rows. The bootstrap
+        # resamples the target only, so without this a member trained with
+        # bootstrap_fraction f would learn f * p_t/p_r.
+        from .ensemble import rebalance_scale
+
+        w_all_np = dataset.w.numpy().reshape(-1)
+        y_all_np = dataset.y.numpy().reshape(-1)
+        tgt_scale = rebalance_scale(w_all_np, y_all_np, idx)
+        if abs(tgt_scale - 1.0) > 1e-12:
+            print(f"[{tag}] target weight rescale {tgt_scale:.6f} to restore a 1:1 class "
+                  f"balance after the target-only bootstrap", flush=True)
+
+        if self.config.log_weights:
+            # Reported on the actual rows this network trains on (bootstrap
+            # included), not on the dataset as a whole.
+            w_rows = w_all_np[idx].copy()
+            w_rows[y_all_np[idx] == 1.0] *= tgt_scale
+            log_weight_summary(w_rows, y_all_np[idx], tag=tag, split="train")
+
         train_loader, val_loader = self.make_loaders(
-            dataset, splits.train if train_idx is None else train_idx, splits.val, seed=seed
+            dataset, idx, splits.val, seed=seed, target_weight_scale=tgt_scale
         )
         checkpoint_dir = self.output_dir / tag / "checkpoints"
         trainer, history = self._lightning_trainer(checkpoint_dir, tag)

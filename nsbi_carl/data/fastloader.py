@@ -61,6 +61,7 @@ class DeviceBatches:
         rank: int = 0,
         world_size: int = 1,
         seed: int = 0,
+        target_weight_scale: float = 1.0,
     ):
         idx = np.asarray(indices, dtype=np.int64)
         if world_size > 1:
@@ -74,12 +75,18 @@ class DeviceBatches:
         self._epoch = 0
 
         # One gather + one transfer, done once for the whole run.
-        sel = torch.as_tensor(idx)
+        # np.array forces a copy: idx may be a read-only memory map from the
+        # ensemble snapshot, which torch warns about.
+        sel = torch.as_tensor(np.array(idx, dtype=np.int64))
         self.x = dataset.x.index_select(0, sel).contiguous().to(self.device, non_blocking=True)
         self.y = dataset.y.index_select(0, sel).reshape(-1).contiguous().to(self.device, non_blocking=True)
         self.w = (
             dataset.w.index_select(0, sel).reshape(-1).float().contiguous().to(self.device, non_blocking=True)
         )
+        # Per-member class rebalancing after a target-only bootstrap (see
+        # ensemble.rebalance_scale). Applied once, here, rather than per batch.
+        if target_weight_scale != 1.0:
+            self.w = torch.where(self.y > 0.5, self.w * float(target_weight_scale), self.w)
         self.n = self.x.shape[0]
 
     # -- DataLoader-compatible surface -------------------------------------

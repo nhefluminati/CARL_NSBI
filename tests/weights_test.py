@@ -203,6 +203,31 @@ def main():
         assert any(issubclass(c.category, RuntimeWarning) for c in caught), "no warning raised"
         ok.append("an extreme target_balance_factor raises a RuntimeWarning")
 
+        # -- 6) bootstrap_fraction must not unbalance the classes ------------
+        # The bootstrap resamples the TARGET only, so at fraction f the target
+        # carries ~f of its weight against a whole reference. Without the
+        # per-member rebalance every member would learn f * p_t/p_r -- the
+        # same defect as an unbalanced target_balance_factor, reintroduced
+        # once per member.
+        from nsbi_carl.training.ensemble import bootstrap_train_indices, rebalance_scale
+
+        d5 = build(tmp)
+        s5 = split.split(d5)
+        ReweightStep().apply(d5, s5)
+        w5 = d5.w.numpy().reshape(-1)
+        y5 = d5.y.numpy().reshape(-1)
+        for frac in (0.5, 0.8, 1.0):
+            idx = bootstrap_train_indices(s5, y5, seed=100, fraction=frac)
+            raw = w5[idx]
+            lab = y5[idx]
+            before = raw[lab == 1.0].sum() / raw[lab == 0.0].sum()
+            scale = rebalance_scale(w5, y5, idx)
+            after = (raw[lab == 1.0].sum() * scale) / raw[lab == 0.0].sum()
+            assert abs(after - 1.0) < 1e-9, f"fraction {frac}: balance {after} after rebalance"
+            if frac < 1.0:
+                assert abs(before - frac) < 0.05, f"fraction {frac}: expected ~{frac}, got {before}"
+        ok.append("target-only bootstrap rebalanced to 1:1 for every bootstrap_fraction")
+
         for line in ok:
             print(f"[ok] {line}")
         print("\nALL WEIGHT CHECKS PASSED")

@@ -49,6 +49,87 @@ import torch
 from .dataset import NSBIDataset, SplitIndices
 
 
+def weight_summary(weights, labels) -> dict:
+    """Per-class weight statistics for a set of events.
+
+    Reported separately for target and reference because the two means are
+    *not* the same number, and confusing them is the easy mistake here:
+    ``normalize_weights`` fixes the mean over the COMBINED set to 1, while the
+    per-class means come out as ``N_combined / (2 * N_class)`` once the classes
+    carry equal total weight. With one target sample against three reference
+    samples, for instance, the target mean is ~2 and the reference mean ~0.67,
+    and both are correct.
+
+    The number to check against 1 is ``combined_mean``. The number to check
+    for CARL's validity is ``balance`` (total target weight over total
+    reference weight), which must be 1.
+    """
+    w = np.asarray(weights, dtype=np.float64).reshape(-1)
+    y = np.asarray(labels).reshape(-1)
+    t, r = w[y == 1.0], w[y == 0.0]
+    out = {
+        "n": int(w.size),
+        "combined_mean": float(w.mean()) if w.size else float("nan"),
+        "n_target": int(t.size),
+        "n_reference": int(r.size),
+        "target_mean": float(t.mean()) if t.size else float("nan"),
+        "reference_mean": float(r.mean()) if r.size else float("nan"),
+        "target_sum": float(t.sum()),
+        "reference_sum": float(r.sum()),
+        "target_min": float(t.min()) if t.size else float("nan"),
+        "target_max": float(t.max()) if t.size else float("nan"),
+        "n_negative": int((w < 0).sum()),
+    }
+    out["balance"] = (
+        out["target_sum"] / out["reference_sum"] if out["reference_sum"] else float("nan")
+    )
+    return out
+
+
+def log_weight_summary(weights, labels, tag: str = "", split: str = "train",
+                       strict_balance: bool = True) -> dict:
+    """Print :func:`weight_summary` as a few aligned lines.
+
+    ``strict_balance`` flags a class balance away from 1. Use it for the
+    TRAIN split, where the balance is fixed by construction and any
+    deviation is a bug. The val/test splits are drawn per sample, so their
+    balance only holds to sampling accuracy and a small deviation there is
+    expected -- they are used for model selection, not for the ratio.
+    """
+    s = weight_summary(weights, labels)
+    p = f"[{tag}] " if tag else ""
+    print(
+        f"{p}{split} weights: combined mean = {s['combined_mean']:.6f}  "
+        f"(this is what normalize_weights sets to 1)",
+        flush=True,
+    )
+    print(
+        f"{p}  target    n={s['n_target']:>9,d}  mean={s['target_mean']:.6g}  "
+        f"sum={s['target_sum']:.6g}  range=[{s['target_min']:.3g}, {s['target_max']:.3g}]",
+        flush=True,
+    )
+    print(
+        f"{p}  reference n={s['n_reference']:>9,d}  mean={s['reference_mean']:.6g}  "
+        f"sum={s['reference_sum']:.6g}",
+        flush=True,
+    )
+    off = abs(s["balance"] - 1.0)
+    if strict_balance and off > 1e-6:
+        note = "   <-- MUST be 1 for r = s/(1-s)"
+    elif not strict_balance and off > 0.05:
+        note = "   (split fluctuation; large enough to be worth a look)"
+    else:
+        note = ""
+    print(f"{p}  target/reference weight ratio = {s['balance']:.6g}{note}", flush=True)
+    if s["n_negative"]:
+        print(
+            f"{p}  WARNING: {s['n_negative']:,} negative weights in this split; "
+            "a weighted BCE is not bounded below with those.",
+            flush=True,
+        )
+    return s
+
+
 class ReweightStep:
     def __init__(
         self,

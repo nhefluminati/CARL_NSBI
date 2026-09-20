@@ -95,6 +95,29 @@ def bootstrap_train_indices(
     return np.concatenate([tgt_out, ref_out])
 
 
+def rebalance_scale(weights: np.ndarray, labels: np.ndarray, idx: np.ndarray) -> float:
+    """Factor restoring equal total weight to the two classes on ``idx``.
+
+    The bootstrap resamples the TARGET only, so with
+    ``bootstrap_fraction < 1`` the target carries only that fraction of its
+    weight while the reference is passed through whole: a member trained on
+    ``bootstrap_fraction: 0.8`` would see a 0.8:1 class balance and therefore
+    learn ``0.8 * p_t/p_r`` instead of the density ratio. Even at fraction 1.0
+    drawing with replacement leaves a small statistical imbalance.
+
+    Multiplying the member's target weights by this factor puts the classes
+    back on equal footing, so every member is a valid CARL estimator on its
+    own resample. It is a per-member weight scale, which cancels from nothing
+    the ensemble mean cares about.
+    """
+    w = np.asarray(weights, dtype=np.float64).reshape(-1)[idx]
+    y = np.asarray(labels).reshape(-1)[idx]
+    t, r = w[y == 1.0].sum(), w[y == 0.0].sum()
+    if t <= 0 or r <= 0:
+        return 1.0
+    return float(r / t)
+
+
 # ---------------------------------------------------------------------------
 # Worker executed in a spawned subprocess: rebuilds the dataset from an .npz
 # snapshot, trains one member on one GPU.
@@ -235,6 +258,7 @@ def _train_group_worker(
         scheduler_t_mult=model_config.get("scheduler_t_mult", 1),
         scheduler_eta_min=model_config.get("scheduler_eta_min", 1e-8),
         compile=tconf.compile,
+        log_weights=tconf.log_weights,
         amp_dtype="bf16" if tconf.precision.startswith("bf16") else "none",
     )
     trainer = VectorizedEnsembleTrainer(

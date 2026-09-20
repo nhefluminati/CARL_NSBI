@@ -95,6 +95,7 @@ class Pipeline:
                 save_last=perf_cfg.get("save_last", False),
                 checkpoint_every_n_epochs=perf_cfg.get("checkpoint_every_n_epochs", 1),
                 progress_bar=perf_cfg.get("progress_bar", True),
+                log_weights=perf_cfg.get("log_weights", True),
             ),
             output_dir=self.output_dir,
             run_name=self.run_name,

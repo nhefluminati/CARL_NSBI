@@ -124,6 +124,43 @@ def main():
             assert "ORDER" in str(e)
         ok.append("load_reference rejects a permuted feature list")
 
+        # -- 7) the target may also BE a reference sample -------------------
+        # Standard NSBI: the reference is a mixture that includes the target
+        # process, so it covers its support. The two copies must stay distinct
+        # internally even though they share a file name.
+        both = DatasetBuilder(
+            target_paths=[str(tmp / "target_a.h5")],
+            reference_paths=[str(tmp / "ref_a.h5"), str(tmp / "target_a.h5")],
+            features=["m4l", "mTZZ"],
+        ).build()
+        assert both.sample_names.count("target_a.h5") == 2, both.sample_names
+        s_both = SplitStep(0.8, 0.1, seed=52).split(both)
+        lab = both.split_label
+        t_idx = np.flatnonzero(both.sample_id == 0)
+        r_idx = np.flatnonzero(both.sample_id == 2)
+        assert np.array_equal(lab[t_idx], lab[r_idx]), (
+            "the target and reference copies of one file landed in different splits"
+        )
+        yb = both.y.numpy().reshape(-1)
+        assert yb[t_idx].all() and not yb[r_idx].any(), "labels not kept distinct"
+        from nsbi_carl.data.reweighting import ReweightStep
+
+        inf = ReweightStep(reference_unit_weights=False).apply(both, s_both)
+        assert len(inf["reference_sample_scales"]) == 2
+        ok.append("a file used as both target and reference stays distinct and splits consistently")
+
+        # -- 8) but a repeated REFERENCE file is rejected --------------------
+        try:
+            DatasetBuilder(
+                target_paths=[str(tmp / "target_a.h5")],
+                reference_paths=[str(tmp / "ref_a.h5"), str(tmp / "ref_a.h5")],
+                features=["m4l", "mTZZ"],
+            )
+            raise AssertionError("duplicate reference file accepted")
+        except ValueError as e:
+            assert "repeated file name" in str(e)
+        ok.append("a repeated reference file name is rejected, not silently merged")
+
         for line in ok:
             print(f"[ok] {line}")
         print("\nALL REFERENCE CHECKS PASSED")

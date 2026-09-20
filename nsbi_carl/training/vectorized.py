@@ -43,6 +43,7 @@ from torch import nn
 import lightning as L
 
 from ..data.dataset import NSBIDataset, SplitIndices
+from ..data.reweighting import log_weight_summary
 from ..model import build_mlp
 
 
@@ -149,6 +150,7 @@ class VectorizedConfig:
     scheduler_t_mult: int = 1
     scheduler_eta_min: float = 1e-8
     compile: bool = False
+    log_weights: bool = True
     amp_dtype: str = "none"  # "none" | "bf16" | "fp16"
     log_every_n_epochs: int = 10
 
@@ -262,8 +264,50 @@ class VectorizedEnsembleTrainer:
         y_all = dataset.y.reshape(-1).to(dev)
         w_all = dataset.w.reshape(-1).float().to(dev)
 
-        val_idx = torch.as_tensor(splits.val, dtype=torch.long, device=dev)
+        # np.array (not asarray) forces a copy: the split indices arrive as a
+        # read-only memory map from the ensemble snapshot, and handing that
+        # straight to torch warns about non-writable tensors. The index arrays
+        # are small, so the copy is free.
+        val_idx = torch.as_tensor(np.array(splits.val, dtype=np.int64), device=dev)
         x_val, y_val, w_val = x_all[val_idx], y_all[val_idx], w_all[val_idx]
+
+        # Per-member class rebalancing. The bootstrap resamples the target
+        # only, so each member's target carries ~bootstrap_fraction of its
+        # weight against a whole reference. Left alone, every member would
+        # learn bootstrap_fraction * p_t/p_r.
+        from .ensemble import rebalance_scale
+
+        w_np_all = dataset.w.numpy().reshape(-1)
+        y_np_all = dataset.y.numpy().reshape(-1)
+        tgt_scale = torch.tensor(
+            [rebalance_scale(w_np_all, y_np_all, boot[m]) for m in range(M)],
+            dtype=torch.float32, device=dev,
+        )
+        if float(tgt_scale.min()) != 1.0 or float(tgt_scale.max()) != 1.0:
+            print(
+                f"[{self.run_name}] per-member target weight rescale to restore a 1:1 class "
+                f"balance after the target-only bootstrap: "
+                f"{[round(float(v), 6) for v in tgt_scale]}",
+                flush=True,
+            )
+
+        if cfg.log_weights:
+            # Member 0's actual training rows (bootstrap applied), so this
+            # describes the tensor the network really sees rather than the
+            # dataset before resampling.
+            rows = boot[0]
+            w_rows = w_np_all[rows].copy()
+            # Report the weights as the network sees them, i.e. after the
+            # member's rebalance factor.
+            w_rows[y_np_all[rows] == 1.0] *= float(tgt_scale[0])
+            log_weight_summary(
+                w_rows, y_np_all[rows],
+                tag=f"{self.run_name} member_{member_ids[0]:03d}", split="train",
+            )
+            log_weight_summary(
+                w_np_all[splits.val], y_np_all[splits.val], tag=self.run_name, split="val  ",
+                strict_balance=False,
+            )
 
         model = StackedMLP(M, dataset.n_features, n_layers, n_nodes, dropout).to(dev)
         model.init_from_seeds(seeds)
@@ -300,7 +344,11 @@ class VectorizedEnsembleTrainer:
                 idx = torch.gather(boot_t, 1, sel)              # (M, B) event ids
                 xb = x_all[idx]                                  # (M, B, F)
                 yb = y_all[idx]
-                wb = w_all[idx]
+                # Target rows carry the member's rebalance factor, so the two
+                # classes contribute equal total weight for every member.
+                wb = w_all[idx] * torch.where(
+                    yb > 0.5, tgt_scale[:, None], torch.ones_like(tgt_scale)[:, None]
+                )
 
                 with self._autocast():
                     logits = forward(xb)                         # (M, B)

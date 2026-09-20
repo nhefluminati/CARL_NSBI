@@ -71,6 +71,21 @@ class DatasetBuilder:
         self.load_reference = str(load_reference) if load_reference else None
         self.save_reference = str(save_reference) if save_reference else None
 
+        # Reference samples are recorded by basename (reference_sample_scales,
+        # the cache's sample list), so two reference files sharing a basename
+        # would silently collapse to one entry and corrupt the run record.
+        # A basename shared between the TARGET and the reference is fine and
+        # deliberate -- an NSBI reference normally contains the target process
+        # so that it covers its support -- so only the reference is checked.
+        ref_names = [Path(p).name for p in self.reference_paths]
+        dupes = sorted({n for n in ref_names if ref_names.count(n) > 1})
+        if dupes:
+            raise ValueError(
+                f"reference_paths contains repeated file name(s) {dupes}. Reference samples "
+                "are recorded by name, so these would overwrite each other in the run record. "
+                "Rename them, or list the file once."
+            )
+
     # ------------------------------------------------------------------
     def _read_sample(self, path: str) -> tuple[np.ndarray, np.ndarray]:
         with h5.File(path, "r") as f:
