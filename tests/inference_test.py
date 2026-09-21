@@ -144,6 +144,53 @@ def main():
         assert set(loaded) == {"S", "B"} and loaded["S"].n_members == 3
         ok.append("load_templates returns ready scorers for the whole set")
 
+        # -- 8) loading the reference straight from its cache file ---------
+        # The analysis must be able to read the same reference file the
+        # networks trained against, rather than restacking MC samples.
+        from nsbi_carl.data.loading import save_reference_cache as _save
+        from nsbi_carl.inference import load_reference_sample, reference_sample_groups
+
+        cache = tmp / "ref_cache.h5"
+        Pipeline(config(tmp, "cached", "S.h5", refs, absolute_weights=True,
+                        save_reference=str(cache))).run()
+        rec_c = read_record(tmp / "cached", "cached")
+
+        x_all, w_all = load_reference_sample(cache, rec_c)
+        assert x_all.shape[1] == len(FEATURES)
+        assert abs(w_all.sum() - 1.0) < 1e-12, w_all.sum()
+        assert (w_all >= 0).all(), "negative weights from the cache"
+        assert x_all.shape[0] == 7000 + 5000, x_all.shape
+        ok.append(f"load_reference_sample: {x_all.shape[0]:,} events, weights sum to 1, all >= 0")
+
+        # the file itself stores |w| when absolute_weights was on
+        with h5.File(cache) as f:
+            assert int((f["weight"][:] < 0).sum()) == 0, "cache kept negative weights"
+            assert bool(f.attrs["absolute_weights"]) is True
+        ok.append("saved cache holds strictly non-negative weights and records the flag")
+
+        # splits are selectable and partition the file
+        sizes = {s: load_reference_sample(cache, rec_c, split=s)[0].shape[0]
+                 for s in ("train", "val", "test")}
+        assert sum(sizes.values()) == x_all.shape[0], sizes
+        ok.append(f"split selection partitions the cache {sizes}")
+
+        # the pooled weights equal what reference_weights builds by hand
+        groups = reference_sample_groups(cache, rec_c)
+        assert len(groups) == 2, [g[0] for g in groups]
+        by_hand = reference_weights(rec_c, [g[2] for g in groups])
+        assert np.allclose(np.sort(w_all), np.sort(by_hand)), "pooled weights disagree"
+        ok.append("per-sample groups reproduce the pooled weights exactly")
+
+        # a wrong feature list is refused, not silently permuted
+        bad = read_record(tmp / "cached", "cached")
+        bad.features = list(reversed(FEATURES))
+        try:
+            load_reference_sample(cache, bad)
+            raise AssertionError("permuted features accepted")
+        except ValueError as e:
+            assert "ORDER" in str(e)
+        ok.append("a permuted feature list is rejected when loading the cache")
+
         for line in ok:
             print(f"[ok] {line}")
         print("\nALL INFERENCE CHECKS PASSED")

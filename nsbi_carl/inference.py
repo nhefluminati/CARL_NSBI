@@ -267,6 +267,77 @@ def reference_weights(record: TemplateRecord, weight_arrays, equalize: bool = Tr
 
 
 # ---------------------------------------------------------------------------
+def load_reference_sample(
+    path: str | Path,
+    record: TemplateRecord,
+    split: str = "all",
+) -> tuple[np.ndarray, np.ndarray]:
+    """Load the reference events and weights from a saved reference cache.
+
+    This is the analysis-side counterpart of ``data.save_reference``: the fit
+    reads the *same file* the networks were trained against, instead of
+    restacking the individual MC samples and hoping the list, the order and
+    the weight handling still match. A feature list that differs from the
+    cache's is rejected by the loader rather than silently permuted.
+
+    ``split`` selects by the cached train/val/test assignment:
+      * ``"all"``  — every cached event; best statistics for p_ref.
+      * ``"test"`` — only events no network trained on, which is what you
+        want if the closure needs to be free of any memorisation.
+
+    Returns ``(features, weights)`` with the weights built exactly as
+    :func:`reference_weights` builds them — per-sample equalisation included —
+    and normalised to sum to 1.
+    """
+    from .data.loading import load_reference_cache
+    from .data.splitting import TEST, TRAIN, VAL
+
+    cache = load_reference_cache(path, record.features)
+    x = np.asarray(cache["x"], dtype=np.float64)
+    w = np.asarray(cache["w"], dtype=np.float64)
+    sid = np.asarray(cache["sample_id"], dtype=np.int64)
+    lab = np.asarray(cache["split_label"], dtype=np.int8)
+
+    key = str(split).lower()
+    if key != "all":
+        want = {"train": TRAIN, "val": VAL, "test": TEST}.get(key)
+        if want is None:
+            raise ValueError(f"split must be 'all', 'train', 'val' or 'test', got {split!r}")
+        keep = lab == want
+        if not keep.any():
+            raise ValueError(f"reference cache {path} has no events in the {key} split")
+        x, w, sid = x[keep], w[keep], sid[keep]
+
+    # Rebuild the weights per sample, in the cache's own sample order, so the
+    # per-sample equalisation matches what training applied.
+    order = np.argsort(sid, kind="stable")
+    x, w, sid = x[order], w[order], sid[order]
+    groups = [w[sid == s] for s in np.unique(sid)]
+    weights = reference_weights(record, groups)
+    return x, weights
+
+
+def reference_sample_groups(path: str | Path, record: TemplateRecord):
+    """Per-sample ``(name, features, raw weights)`` from a reference cache.
+
+    For code that needs the reference split back into its constituent
+    samples — calibration, per-sample diagnostics — rather than as one pool.
+    """
+    from .data.loading import load_reference_cache
+
+    cache = load_reference_cache(path, record.features)
+    x = np.asarray(cache["x"], dtype=np.float64)
+    w = np.asarray(cache["w"], dtype=np.float64)
+    sid = np.asarray(cache["sample_id"], dtype=np.int64)
+    names = list(cache["sample_names"])
+    out = []
+    for s in np.unique(sid):
+        m = sid == s
+        name = names[int(s)] if int(s) < len(names) else f"sample_{int(s)}"
+        out.append((name, x[m], w[m]))
+    return out
+
+
 def validate_templates(records, balance_tol: float = 0.01, raise_on_error: bool = False) -> list[str]:
     """Check the assumptions a multi-template NSBI fit silently relies on.
 
