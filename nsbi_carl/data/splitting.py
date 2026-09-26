@@ -106,3 +106,145 @@ def reference_fingerprint(dataset: NSBIDataset, splits: SplitIndices) -> dict[st
         out[f"{key}_sha1"] = h.hexdigest()
         out[f"{key}_n"] = int(ref.size)
     return out
+
+
+# ---------------------------------------------------------------------------
+# k-fold cross-validation (INT note Sec. 2.7.2)
+# ---------------------------------------------------------------------------
+# Every event of every sample is put in exactly one of k folds. Fold f's
+# ensemble trains on the other k-1 folds and is the ONLY ensemble ever used to
+# score fold f's events, so no event is scored by a network that saw it.
+#
+# The fold of an event depends only on (fold_seed, sample file name, k, row
+# index within that sample) -- not on the run seed, the other samples, or
+# whether the sample is the target or part of the reference. Two consequences
+# the likelihood relies on:
+#
+#  * a reference event sits in the same fold for EVERY template, so all the
+#    ratios combined for it come from networks that never saw it;
+#  * a sample that is both a target (S for the S network) and part of the
+#    reference gets the identical assignment in both roles.
+#
+# `fold_seed` must therefore be the same for every template of an analysis;
+# validate_templates() checks this.
+#
+# Before the folds are dealt, a `test_fraction` of every sample is set aside
+# as fold TEST_FOLD (-1): a final test set that no member of any fold ever
+# trains or validates on. Being keyed the same way, it is the same events for
+# every template, so a reference test event is untouched by ALL networks.
+DEFAULT_FOLD_SEED = 20240607
+TEST_FOLD = -1
+
+
+def fold_assignment(
+    sample_name: str,
+    n_events: int,
+    k: int,
+    fold_seed: int = DEFAULT_FOLD_SEED,
+    test_fraction: float = 0.0,
+) -> np.ndarray:
+    """Fold of every row of one sample: ``TEST_FOLD`` (-1) for the untouched
+    test set, else 0..k-1, balanced to +-1 event."""
+    if k < 2:
+        raise ValueError(f"k-fold needs k >= 2, got {k}")
+    if not 0.0 <= test_fraction < 1.0:
+        raise ValueError(f"test_fraction must be in [0, 1), got {test_fraction}")
+    rng = np.random.default_rng([int(fold_seed), zlib.crc32(sample_name.encode()), int(k)])
+    perm = rng.permutation(n_events)
+    n_test = int(round(test_fraction * n_events))
+    folds = np.empty(n_events, dtype=np.int16)
+    folds[perm[:n_test]] = TEST_FOLD
+    folds[perm[n_test:]] = np.arange(n_events - n_test) % k
+    return folds
+
+
+class KFoldStep:
+    """Assigns folds and builds the per-member index sets of a k-fold ensemble.
+
+    A ``test_fraction`` of every sample is first set aside (fold -1) and
+    never enters any fold's pool: it is the final test set of the ensemble.
+
+    Inside the k-1 training folds, each member gets its own train/validation
+    split, drawn WITHOUT replacement (``val_fraction`` goes to validation):
+
+    * target events: redrawn for every member (seeded by the member seed), as
+      in the note, where each member sees a different 80/20 split;
+    * reference events: one split per fold, seeded by ``fold_seed`` only, so
+      every member of every template trained on fold f shares byte-identical
+      reference train and validation events -- the common-denominator
+      guarantee the bootstrap path gives, now per fold.
+    """
+
+    def __init__(
+        self,
+        k: int = 10,
+        fold_seed: int = DEFAULT_FOLD_SEED,
+        val_fraction: float = 0.2,
+        test_fraction: float = 0.1,
+    ):
+        if k < 2:
+            raise ValueError(f"split.k_folds must be >= 2, got {k}")
+        if not 0.0 < val_fraction < 1.0:
+            raise ValueError(f"split.kfold_val_fraction must be in (0, 1), got {val_fraction}")
+        if not 0.0 <= test_fraction < 1.0:
+            raise ValueError(f"split.kfold_test_fraction must be in [0, 1), got {test_fraction}")
+        self.k = int(k)
+        self.fold_seed = int(fold_seed)
+        self.val_fraction = float(val_fraction)
+        self.test_fraction = float(test_fraction)
+
+    def assign(self, dataset: NSBIDataset) -> np.ndarray:
+        """Per-event fold index for the whole dataset (rows in sample order)."""
+        folds = np.empty(len(dataset.sample_id), dtype=np.int16)
+        for sid, name in enumerate(dataset.sample_names):
+            idx = np.flatnonzero(dataset.sample_id == sid)
+            if idx.size:
+                folds[idx] = fold_assignment(
+                    name, idx.size, self.k, self.fold_seed, self.test_fraction
+                )
+        return folds
+
+    def member_indices(
+        self,
+        dataset: NSBIDataset,
+        folds: np.ndarray,
+        fold: int,
+        member_seed: int,
+    ) -> SplitIndices:
+        """``SplitIndices(train, val, test=holdout)`` for one member of ``fold``.
+
+        The pool is the other k-1 folds; the untouched test set (fold -1) is
+        in neither the pool nor the holdout.
+        """
+        if not 0 <= fold < self.k:
+            raise ValueError(f"fold must be in 0..{self.k - 1}, got {fold}")
+        y = dataset.y.numpy().reshape(-1)
+        train_parts, val_parts = [], []
+        for sid, name in enumerate(dataset.sample_names):
+            pool = np.flatnonzero(
+                (dataset.sample_id == sid) & (folds != fold) & (folds != TEST_FOLD)
+            )
+            if pool.size == 0:
+                continue
+            is_ref = bool(y[pool[0]] == 0.0)
+            if is_ref:
+                rng = np.random.default_rng([self.fold_seed, zlib.crc32(name.encode()), fold, 1])
+            else:
+                rng = np.random.default_rng([int(member_seed), zlib.crc32(name.encode()), fold, 2])
+            perm = pool[rng.permutation(pool.size)]
+            n_val = int(round(self.val_fraction * pool.size))
+            val_parts.append(perm[:n_val])
+            train_parts.append(perm[n_val:])
+
+        # Target rows first, reference rows last and in a fixed order, so the
+        # reference block is identical across the members of a fold.
+        def _ordered(parts):
+            idx = np.concatenate(parts) if parts else np.empty(0, dtype=np.int64)
+            t, r = idx[y[idx] == 1.0], np.sort(idx[y[idx] == 0.0])
+            return np.concatenate([t, r]).astype(np.int64)
+
+        return SplitIndices(
+            train=_ordered(train_parts),
+            val=_ordered(val_parts),
+            test=np.flatnonzero(folds == fold).astype(np.int64),
+        )

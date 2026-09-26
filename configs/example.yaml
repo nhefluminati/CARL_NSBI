@@ -16,6 +16,14 @@ data:
 split:
   train_fraction: 0.8
   val_fraction: 0.1               
+  k_folds: 0                      # >= 2: k-fold cross-validation (INT note 2.7.2).
+                                  # Replaces the bootstrap: ensemble.n_members is then
+                                  # members PER FOLD, trained without replacement on the
+                                  # other k-1 folds; score MC with score_out_of_fold.
+  fold_seed: 20240607             # k-fold only; MUST be identical for every template
+  kfold_val_fraction: 0.2         # k-fold only; per-member validation share of the pool
+  kfold_test_fraction: 0.1        # k-fold only; set aside BEFORE the folds as a final
+                                  # test set no member trains or validates on
 
 model:
   n_layers: 5
@@ -57,6 +65,10 @@ ensemble:
   bootstrap: true
   bootstrap_fraction: 0.8
   start_member: 0                 # set > 0 to extend/resume an existing ensemble
+  combiner: mean_score            # how member scores become one score:
+                                  # mean_score | mean_ratio | mean_logit |
+                                  # median_ratio | trimmed_ratio  (nsbi_carl/combine.py)
+  combiner_trim: 0.1              # trimmed_ratio only: fraction cut at each end
 
   # "vectorized": every member assigned to a GPU trains simultaneously as one
   #   batched matmul. M members cost roughly one member's wall time, because

@@ -15,12 +15,21 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
+
+from .combine import DEFAULT_COMBINER, validate_combiner
 from .config import RunRecord, load_config
 from .data.dataset import NSBIDataset, SplitIndices
 from .data.loading import DatasetBuilder, save_reference_cache
 from .data.reweighting import ReweightStep
 from .data.scaling import StandardScalerStep
-from .data.splitting import SplitStep, reference_fingerprint
+from .data.splitting import (
+    DEFAULT_FOLD_SEED,
+    TEST_FOLD,
+    KFoldStep,
+    SplitStep,
+    reference_fingerprint,
+)
 from .evaluation import base as _eval_base
 from .evaluation import metrics as _metrics  # noqa: F401  (populate registries)
 from .evaluation import plots as _plots      # noqa: F401
@@ -54,6 +63,19 @@ class Pipeline:
             train_fraction=split_cfg.get("train_fraction", 0.8),
             val_fraction=split_cfg.get("val_fraction", 0.1),
             seed=self.seed,
+        )
+        # k-fold cross-validation replaces the fixed train/val/test split and
+        # the bootstrap pooling for ensemble training (see KFoldStep).
+        k_folds = int(split_cfg.get("k_folds", 0) or 0)
+        self.kfold_step: KFoldStep | None = (
+            KFoldStep(
+                k=k_folds,
+                fold_seed=int(split_cfg.get("fold_seed", DEFAULT_FOLD_SEED)),
+                val_fraction=float(split_cfg.get("kfold_val_fraction", 0.2)),
+                test_fraction=float(split_cfg.get("kfold_test_fraction", 0.1)),
+            )
+            if k_folds
+            else None
         )
         self.reweight_step = ReweightStep(
             reference_unit_weights=data_cfg.get("reference_unit_weights", True),
@@ -118,14 +140,34 @@ class Pipeline:
                     start_member=ens_cfg.get("start_member", 0),
                     mode=ens_cfg.get("mode", "vectorized"),
                     members_per_group=ens_cfg.get("members_per_group", 0),
+                    combiner=validate_combiner(
+                        ens_cfg.get("combiner", DEFAULT_COMBINER),
+                        ens_cfg.get("combiner_trim", 0.1),
+                    ),
+                    combiner_trim=float(ens_cfg.get("combiner_trim", 0.1)),
+                    k_folds=self.kfold_step.k if self.kfold_step else 0,
+                    fold_seed=self.kfold_step.fold_seed if self.kfold_step else DEFAULT_FOLD_SEED,
+                    kfold_val_fraction=(
+                        self.kfold_step.val_fraction if self.kfold_step else 0.2
+                    ),
+                    kfold_test_fraction=(
+                        self.kfold_step.test_fraction if self.kfold_step else 0.1
+                    ),
                 ),
                 output_dir=self.output_dir,
                 run_name=self.run_name,
             )
 
+        if self.kfold_step is not None and self.ensemble is None:
+            raise ValueError(
+                "split.k_folds needs ensemble.enabled: true -- k-fold trains one ensemble "
+                "per fold (ensemble.n_members members each)."
+            )
+
         # filled by run():
         self.dataset: NSBIDataset | None = None
         self.splits: SplitIndices | None = None
+        self.folds: np.ndarray | None = None
 
     # ------------------------------------------------------------------
     @classmethod
@@ -145,16 +187,47 @@ class Pipeline:
             n_reference=dataset.n_reference,
         )
 
+        # The fixed split always runs: it assigns the per-event split labels a
+        # reference cache stores, so caches stay usable in both modes.
         splits = self.split_step.split(dataset)
-        self.record.update(
-            split={
-                "train_fraction": self.split_step.train_fraction,
-                "val_fraction": self.split_step.val_fraction,
-                "n_train": len(splits.train),
-                "n_val": len(splits.val),
-                "n_test": len(splits.test),
-            }
-        )
+        if self.kfold_step is None:
+            self.record.update(
+                split={
+                    "mode": "fixed",
+                    "train_fraction": self.split_step.train_fraction,
+                    "val_fraction": self.split_step.val_fraction,
+                    "n_train": len(splits.train),
+                    "n_val": len(splits.val),
+                    "n_test": len(splits.test),
+                }
+            )
+        else:
+            # k-fold: the cross-validated events (folds 0..k-1) are used for
+            # training (in k-1 of the folds' ensembles) and scored by their own
+            # fold's. The untouched test set (fold -1) is kept out of all of it
+            # -- including the reweighting and scaler fits below, which are
+            # fixed on the cross-validated events only. Each member restores
+            # its own 1:1 class balance on the rows it actually trains on.
+            self.folds = self.kfold_step.assign(dataset)
+            cv = np.flatnonzero(self.folds != TEST_FOLD).astype(np.int64)
+            splits = SplitIndices(
+                train=cv,
+                val=np.empty(0, np.int64),
+                test=np.flatnonzero(self.folds == TEST_FOLD).astype(np.int64),
+            )
+            self.record.update(
+                split={
+                    "mode": "kfold",
+                    "k_folds": self.kfold_step.k,
+                    "fold_seed": self.kfold_step.fold_seed,
+                    "kfold_val_fraction": self.kfold_step.val_fraction,
+                    "kfold_test_fraction": self.kfold_step.test_fraction,
+                    "n_per_fold": np.bincount(
+                        self.folds[cv], minlength=self.kfold_step.k
+                    ).tolist(),
+                    "n_test": len(splits.test),
+                }
+            )
 
         # The reference is the common denominator of every template's network,
         # so record a hash of it. Two runs agreeing on these digests trained
@@ -183,6 +256,29 @@ class Pipeline:
 
     def run(self) -> dict:
         dataset, splits = self.prepare_data()
+
+        if self.ensemble is not None and self.kfold_step is not None:
+            summaries = self.ensemble.train(dataset, splits, folds=self.folds)
+            k = self.kfold_step.k
+            by_fold = [[s["tag"] for s in summaries if s.get("fold") == f] for f in range(k)]
+            # Written before evaluation so a crash there still leaves a
+            # usable record behind.
+            self.record.update(
+                ensemble_members=[s["tag"] for s in summaries],
+                kfold={
+                    "k_folds": k,
+                    "fold_seed": self.kfold_step.fold_seed,
+                    "kfold_val_fraction": self.kfold_step.val_fraction,
+                    "kfold_test_fraction": self.kfold_step.test_fraction,
+                    "members": by_fold,
+                },
+            )
+            metrics = self.ensemble.evaluate(
+                dataset, np.arange(len(dataset)), tag="ensemble_test", folds=self.folds
+            )
+            self.record.update(final_metrics=metrics)
+            return {"summaries": summaries, "metrics": metrics, "ensemble": self.ensemble,
+                    "folds": self.folds}
 
         if self.ensemble is not None:
             summaries = self.ensemble.train(dataset, splits)

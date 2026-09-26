@@ -257,7 +257,7 @@ class CARLTrainer:
         tgt_scale = rebalance_scale(w_all_np, y_all_np, idx)
         if abs(tgt_scale - 1.0) > 1e-12:
             print(f"[{tag}] target weight rescale {tgt_scale:.6f} to restore a 1:1 class "
-                  f"balance after the target-only bootstrap", flush=True)
+                  f"balance after resampling the training rows", flush=True)
 
         if self.config.log_weights:
             # Reported on the actual rows this network trains on (bootstrap

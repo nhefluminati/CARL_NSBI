@@ -36,6 +36,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from .combine import DEFAULT_COMBINER, combine_scores, validate_combiner
 from .config import load_config
 from .model import CARL
 
@@ -70,6 +71,39 @@ class TemplateRecord:
     load_reference: str | None = None
     raw: dict = field(default_factory=dict)
 
+    # -- ensemble combination (ensemble.combiner in the training config) --
+    combiner: str = DEFAULT_COMBINER
+    combiner_trim: float = 0.1
+
+    # -- k-fold cross-validation (split.k_folds in the training config) ---
+    # k_folds == 0 means the run used the fixed split + bootstrap pooling.
+    # fold_members[f] indexes into ``checkpoints``: the members of fold f,
+    # i.e. the ONLY networks allowed to score fold f's events.
+    k_folds: int = 0
+    fold_seed: int | None = None
+    kfold_test_fraction: float = 0.0     # share kept as the untouched test set (fold -1)
+    fold_members: list = field(default_factory=list)
+
+    @property
+    def kfold(self) -> bool:
+        return self.k_folds >= 2
+
+    def folds_for(self, sample_name: str, n_events: int) -> np.ndarray:
+        """Fold of every row of the sample file ``sample_name`` (its basename):
+        -1 for the untouched test set, else 0..k-1.
+
+        Rows must be in the file's own order: the assignment is a function of
+        (fold_seed, file name, row index), identical to what training used.
+        """
+        if not self.kfold:
+            raise ValueError(f"[{self.name}] this run was not trained with k-fold")
+        from .data.splitting import fold_assignment
+
+        return fold_assignment(
+            Path(sample_name).name, int(n_events), self.k_folds, self.fold_seed,
+            self.kfold_test_fraction,
+        )
+
     @property
     def class_balance(self) -> float | None:
         """Ratio of target to reference total weight on the train split."""
@@ -96,10 +130,20 @@ def read_record(run_dir: str | Path, name: str) -> TemplateRecord:
         raise KeyError(f"[{name}] {path} has no preprocessing/scaler_mean; run incomplete?")
 
     data_cfg = ((rec.get("config") or {}).get("data")) or {}
+    ens_cfg = ((rec.get("config") or {}).get("ensemble")) or {}
     rw = rec.get("reweighting") or {}
 
     tags = list(rec.get("ensemble_members") or [])
     checkpoints = _resolve_checkpoints(run_dir, name, tags)
+
+    kf = rec.get("kfold") or {}
+    fold_members: list[list[int]] = []
+    if kf:
+        pos = {t: i for i, t in enumerate(tags)}
+        missing = [t for fold in kf["members"] for t in fold if t not in pos]
+        if missing:
+            raise KeyError(f"[{name}] k-fold members {missing[:5]} not in ensemble_members")
+        fold_members = [[pos[t] for t in fold] for fold in kf["members"]]
 
     return TemplateRecord(
         name=name,
@@ -128,6 +172,14 @@ def read_record(run_dir: str | Path, name: str) -> TemplateRecord:
         reference_paths=list(data_cfg.get("reference_paths") or []),
         load_reference=data_cfg.get("load_reference"),
         raw=rec,
+        # Records written before combiners existed averaged the scores.
+        combiner=str(ens_cfg.get("combiner", DEFAULT_COMBINER)),
+        combiner_trim=float(ens_cfg.get("combiner_trim", 0.1)),
+        k_folds=int(kf.get("k_folds", 0)),
+        fold_seed=kf.get("fold_seed"),
+        # Runs written before the test set existed had none.
+        kfold_test_fraction=float(kf.get("kfold_test_fraction", 0.0)),
+        fold_members=fold_members,
     )
 
 
@@ -167,32 +219,67 @@ class EnsembleScorer:
     """Scores raw (unscaled) events with a trained ensemble.
 
     Applies the run's own scaler, then evaluates every member in a single
-    stacked pass. ``score`` returns the ensemble mean; ``member_scores``
-    returns the ``(n_members, n_events)`` matrix, which is what an ensemble
-    spread / systematic needs.
+    stacked pass. ``score`` returns the combined score (see
+    :mod:`nsbi_carl.combine`); ``member_scores`` returns the
+    ``(n_members, n_events)`` matrix, which is what an ensemble spread /
+    systematic needs.
+
+    The combiner defaults to the one in the run record (``ensemble.combiner``
+    at training time). Pass ``combiner=`` / ``combiner_trim=`` to override it
+    at analysis time without retraining; ``set_combiner`` changes it later.
+
+    k-fold runs: ``score_out_of_fold(x, folds)`` scores each event only with
+    networks that never saw it -- its own fold's members, or ALL members for
+    the untouched test set (fold -1). Use it for every MC sample (the Asimov,
+    the reference pool, closure tests), with the folds from
+    ``record.folds_for(file_name, n_rows)`` or ``load_reference_sample(...,
+    return_folds=True)``. ``score`` pools ALL members of all folds, which is
+    right only for events no network has seen: real data, or the test set.
     """
 
-    def __init__(self, record: TemplateRecord, device: str | torch.device = "cpu"):
+    def __init__(
+        self,
+        record: TemplateRecord,
+        device: str | torch.device = "cpu",
+        combiner: str | None = None,
+        combiner_trim: float | None = None,
+    ):
         self.record = record
         self.device = torch.device(device)
+        self.set_combiner(combiner, combiner_trim)
         self.models = [
             CARL.load_from_checkpoint(p, map_location="cpu").eval() for p in record.checkpoints
         ]
         for m in self.models:
             for p in m.parameters():
                 p.requires_grad_(False)
-        self._stacked = self._build_stacked()
+        if record.kfold:
+            if len(record.fold_members) != record.k_folds or not all(record.fold_members):
+                raise ValueError(f"[{record.name}] run record lists incomplete k-fold members")
+            self._stacks = [self._build_stacked(idx) for idx in record.fold_members]
+        else:
+            self._stacks = [self._build_stacked(list(range(len(self.models))))]
+        # One scoring pass evaluates one of these stacks at a time; exposed as
+        # `_stacked` for code that sizes batches from its shape.
+        self._stacked = self._stacks[0]
+
+    def set_combiner(self, combiner: str | None = None, trim: float | None = None) -> None:
+        self.combiner_trim = float(self.record.combiner_trim if trim is None else trim)
+        self.combiner = validate_combiner(
+            self.record.combiner if combiner is None else combiner, self.combiner_trim
+        )
 
     @property
     def n_members(self) -> int:
         return len(self.models)
 
-    def _build_stacked(self):
+    def _build_stacked(self, member_idx: list[int]):
         from .training.vectorized import StackedMLP
 
-        hp = self.models[0].hparams
+        models = [self.models[i] for i in member_idx]
+        hp = models[0].hparams
         model = StackedMLP(
-            n_members=len(self.models),
+            n_members=len(models),
             n_features=hp["n_features"],
             n_layers=hp["n_layers"],
             n_nodes=hp["n_nodes"],
@@ -200,7 +287,7 @@ class EnsembleScorer:
         )
         stride = 3 if hp.get("dropout", 0.0) > 0.0 else 2
         with torch.no_grad():
-            for m, member in enumerate(self.models):
+            for m, member in enumerate(models):
                 sd = member.state_dict()
                 for layer in range(len(model.weights)):
                     idx = layer * stride
@@ -220,18 +307,89 @@ class EnsembleScorer:
         return (x - self.record.scaler_mean) / self.record.scaler_std
 
     @torch.no_grad()
+    def _batches(self, xs: torch.Tensor, stacks, batch_size: int):
+        """Yield ``(start, (M, B) scores)`` with ``stacks`` concatenated."""
+        for i in range(0, len(xs), batch_size):
+            xb = xs[i : i + batch_size].to(self.device)
+            yield i, torch.cat([torch.sigmoid(s(xb)) for s in stacks], dim=0).cpu().numpy()
+
     def member_scores(self, x_raw: np.ndarray, batch_size: int = 200_000) -> np.ndarray:
+        """``(n_members, n_events)``; in a k-fold run, all folds' members."""
         xs = torch.as_tensor(self.scale(x_raw), dtype=torch.float32)
-        out = [
-            torch.sigmoid(self._stacked(xs[i : i + batch_size].to(self.device))).cpu()
-            for i in range(0, len(xs), batch_size)
-        ]
+        out = [b for _, b in self._batches(xs, self._stacks, batch_size)]
         if not out:
             return np.zeros((self.n_members, 0))
-        return torch.cat(out, dim=1).numpy()
+        return np.concatenate(out, axis=1)
 
     def score(self, x_raw: np.ndarray, batch_size: int = 200_000) -> np.ndarray:
-        return self.member_scores(x_raw, batch_size=batch_size).mean(axis=0)
+        """Combined score from ALL members (all folds, for a k-fold run).
+
+        Combined batch by batch, so the full member matrix is never held.
+        """
+        xs = torch.as_tensor(self.scale(x_raw), dtype=torch.float32)
+        out = np.empty(len(xs), dtype=np.float64)
+        for i, b in self._batches(xs, self._stacks, batch_size):
+            out[i : i + b.shape[1]] = combine_scores(b, self.combiner, self.combiner_trim)
+        return out
+
+    def fold_member_scores(
+        self, x_raw: np.ndarray, folds: np.ndarray, batch_size: int = 200_000
+    ) -> np.ndarray:
+        """``(members_per_fold, n_events)``: column i from event i's own fold.
+
+        Not defined for test-set events (fold -1): every member is
+        out-of-sample for them; use :meth:`member_scores`.
+        """
+        folds = self._check_folds(x_raw, folds)
+        if np.any(folds < 0):
+            raise ValueError(
+                f"[{self.record.name}] test-set events (fold -1) have no own fold; "
+                "use member_scores() for them"
+            )
+        sizes = {len(m) for m in self.record.fold_members}
+        if len(sizes) != 1:
+            raise ValueError(f"[{self.record.name}] folds have unequal member counts")
+        out = np.empty((sizes.pop(), len(folds)), dtype=np.float32)
+        for f, stack in enumerate(self._stacks):
+            sel = np.flatnonzero(folds == f)
+            if sel.size:
+                xs = torch.as_tensor(self.scale(np.asarray(x_raw)[sel]), dtype=torch.float32)
+                for i, b in self._batches(xs, [stack], batch_size):
+                    out[:, sel[i : i + b.shape[1]]] = b
+        return out
+
+    def score_out_of_fold(
+        self, x_raw: np.ndarray, folds: np.ndarray, batch_size: int = 200_000
+    ) -> np.ndarray:
+        """Combined score of every event using only networks that never saw
+        it: its own fold's members, or ALL members for the test set (fold -1).
+        Use this for all MC."""
+        folds = self._check_folds(x_raw, folds)
+        out = np.empty(len(folds), dtype=np.float64)
+        test = np.flatnonzero(folds < 0)
+        if test.size:
+            out[test] = self.score(np.asarray(x_raw)[test], batch_size=batch_size)
+        for f, stack in enumerate(self._stacks):
+            sel = np.flatnonzero(folds == f)
+            if sel.size:
+                xs = torch.as_tensor(self.scale(np.asarray(x_raw)[sel]), dtype=torch.float32)
+                for i, b in self._batches(xs, [stack], batch_size):
+                    out[sel[i : i + b.shape[1]]] = combine_scores(
+                        b, self.combiner, self.combiner_trim
+                    )
+        return out
+
+    def _check_folds(self, x_raw, folds) -> np.ndarray:
+        if not self.record.kfold:
+            raise ValueError(f"[{self.record.name}] out-of-fold scoring needs a k-fold run")
+        folds = np.asarray(folds).reshape(-1)
+        if len(folds) != len(x_raw):
+            raise ValueError(f"[{self.record.name}] {len(folds)} folds for {len(x_raw)} events")
+        if folds.size and (folds.min() < -1 or folds.max() >= self.record.k_folds):
+            raise ValueError(
+                f"[{self.record.name}] fold ids outside -1..{self.record.k_folds - 1}"
+            )
+        return folds
 
     __call__ = score
 
@@ -271,7 +429,8 @@ def load_reference_sample(
     path: str | Path,
     record: TemplateRecord,
     split: str = "all",
-) -> tuple[np.ndarray, np.ndarray]:
+    return_folds: bool = False,
+):
     """Load the reference events and weights from a saved reference cache.
 
     This is the analysis-side counterpart of ``data.save_reference``: the fit
@@ -285,9 +444,17 @@ def load_reference_sample(
       * ``"test"`` — only events no network trained on, which is what you
         want if the closure needs to be free of any memorisation.
 
+    For a k-fold ``record`` the selection follows the FOLDS instead of the
+    cached labels: ``"test"`` is the untouched test set (fold -1), ``"cv"``
+    the cross-validated events, ``"all"`` both. (``"train"``/``"val"`` have
+    no meaning there.)
+
     Returns ``(features, weights)`` with the weights built exactly as
     :func:`reference_weights` builds them — per-sample equalisation included —
-    and normalised to sum to 1.
+    and normalised to sum to 1. With ``return_folds=True`` (k-fold runs)
+    returns ``(features, weights, folds)``, the folds aligned with the rows,
+    for :meth:`EnsembleScorer.score_out_of_fold`. In a k-fold run use
+    ``split="all"``: out-of-fold scoring is what keeps it clean.
     """
     from .data.loading import load_reference_cache
     from .data.splitting import TEST, TRAIN, VAL
@@ -297,24 +464,54 @@ def load_reference_sample(
     w = np.asarray(cache["w"], dtype=np.float64)
     sid = np.asarray(cache["sample_id"], dtype=np.int64)
     lab = np.asarray(cache["split_label"], dtype=np.int8)
+    if record.kfold:
+        folds = _cache_folds(cache, record)
+    else:
+        folds = np.zeros(len(sid), np.int16)
 
     key = str(split).lower()
-    if key != "all":
+    if record.kfold and key != "all":
+        keep = {"test": folds < 0, "cv": folds >= 0}.get(key)
+        if keep is None:
+            raise ValueError(f"for a k-fold run split must be 'all', 'cv' or 'test', got {split!r}")
+        if not keep.any():
+            raise ValueError(f"no reference events in the k-fold {key} set "
+                             f"(kfold_test_fraction={record.kfold_test_fraction})")
+        x, w, sid, folds = x[keep], w[keep], sid[keep], folds[keep]
+    elif key != "all":
         want = {"train": TRAIN, "val": VAL, "test": TEST}.get(key)
         if want is None:
             raise ValueError(f"split must be 'all', 'train', 'val' or 'test', got {split!r}")
         keep = lab == want
         if not keep.any():
             raise ValueError(f"reference cache {path} has no events in the {key} split")
-        x, w, sid = x[keep], w[keep], sid[keep]
+        x, w, sid, folds = x[keep], w[keep], sid[keep], folds[keep]
 
     # Rebuild the weights per sample, in the cache's own sample order, so the
     # per-sample equalisation matches what training applied.
     order = np.argsort(sid, kind="stable")
-    x, w, sid = x[order], w[order], sid[order]
+    x, w, sid, folds = x[order], w[order], sid[order], folds[order]
     groups = [w[sid == s] for s in np.unique(sid)]
     weights = reference_weights(record, groups)
+    if return_folds:
+        return x, weights, folds
     return x, weights
+
+
+def _cache_folds(cache: dict, record: TemplateRecord) -> np.ndarray:
+    """Fold of every cached reference event.
+
+    The cache stores each sample's events in the order of its source file,
+    so an event's row within its sample is its row in that file -- the same
+    index training used when it assigned folds.
+    """
+    sid = np.asarray(cache["sample_id"], dtype=np.int64)
+    names = list(cache["sample_names"])
+    folds = np.empty(len(sid), dtype=np.int16)
+    for s in np.unique(sid):
+        rows = np.flatnonzero(sid == s)
+        folds[rows] = record.folds_for(names[int(s)], rows.size)
+    return folds
 
 
 def reference_sample_groups(path: str | Path, record: TemplateRecord):
@@ -387,6 +584,20 @@ def validate_templates(records, balance_tol: float = 0.01, raise_on_error: bool 
     feats = {r.name: tuple(r.features) for r in records}
     if len(set(feats.values())) > 1:
         problems.append(f"templates disagree on the feature list/order: {feats}")
+
+    # -- 5) one fold scheme for all templates -----------------------------
+    # A reference event is only scored cleanly if it sits in the same fold
+    # for every template, which needs the same k and fold_seed everywhere.
+    schemes = {
+        r.name: (r.k_folds, r.fold_seed, r.kfold_test_fraction) if r.kfold else (0, None, None)
+        for r in records
+    }
+    if len(set(schemes.values())) > 1:
+        problems.append(
+            f"templates disagree on the k-fold scheme (k_folds, fold_seed, "
+            f"kfold_test_fraction): {schemes}. Out-of-fold scoring of the shared reference "
+            "is then not clean, and the test sets are not the same events."
+        )
 
     # -- 4) reference construction must agree ------------------------------
     for key in ("reference_unit_weights", "absolute_weights"):

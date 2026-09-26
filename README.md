@@ -176,8 +176,57 @@ Resume / extend with `start_member`. Afterwards:
 ```python
 result = Pipeline.from_yaml("configs/example.yaml").run()
 ensemble = result["ensemble"]
-scores = ensemble.inference(x_scaled)   # average over members
+scores = ensemble.inference(x_scaled)   # combined per ensemble.combiner
 ```
+
+**k-fold cross-validation.** `split.k_folds: 10` switches the ensemble from
+bootstrap pooling to the scheme of the INT note (Sec. 2.7.2). Every event of
+every sample is put in one of k folds; fold f gets `ensemble.n_members`
+members, each trained on its own train/validation split of the other k-1
+folds, drawn **without** replacement (`split.kfold_val_fraction` to
+validation). The bootstrap settings are ignored. Target rows are redrawn per
+member; reference rows are fixed per fold, so every member of every template
+shares the same reference events within a fold.
+
+Before the folds are dealt, `split.kfold_test_fraction` (default 0.1) of
+every sample is set aside as fold -1: a final test set that no member of any
+fold trains or validates on, and that the reweighting and scaler fits do not
+see either. It is scored by the whole ensemble.
+
+The fold of an event depends only on `split.fold_seed`, the sample's file
+name, `k` and the event's row in that file — not on the run seed or on
+whether the sample is a target or part of the reference. Use the same
+`k_folds`, `fold_seed` and `kfold_test_fraction` for all templates
+(`validate_templates` checks it); a reference event then sits in the same fold
+— and the same test set — for every template.
+
+Fold f's members are the only networks allowed to score fold f's events;
+test-set events are scored by all members:
+
+```python
+rec = read_record(run_dir, "S")
+scorer = EnsembleScorer(rec)
+folds = rec.folds_for("4l_SR_S.h5", n_rows)          # rows in file order
+r_S = scorer.score_out_of_fold(x_S, folds)            # all MC: Asimov, closure
+x_ref, w_ref, f_ref = load_reference_sample(cache, rec, split="all", return_folds=True)
+# split="test": only the untouched test events; split="cv": the rest
+r_ref = scorer.score_out_of_fold(x_ref, f_ref)        # reference pool
+r_data = scorer.score(x_data)                         # data: all k*n members
+```
+
+The after-training evaluation runs twice: `ensemble_test` on the untouched
+test set with the whole ensemble, and `ensemble_test_out_of_fold` on the
+cross-validated events, each scored by its own fold.
+
+**Combining members.** `ensemble.combiner` sets how the member scores become
+one score: `mean_score` (default, the historical behaviour), `mean_ratio`,
+`mean_logit` (geometric mean of the ratios), `median_ratio`, or
+`trimmed_ratio` (with `combiner_trim`). Because `r = s/(1-s)` is convex,
+averaging scores gives a smaller ratio than averaging ratios wherever the
+members disagree, which is typically where the reference is thin. The choice
+is stored in the run record and picked up by `EnsembleScorer`; override it at
+analysis time with `EnsembleScorer(record, combiner="mean_ratio")` or
+`scorer.set_combiner(...)` — no retraining needed. See `nsbi_carl/combine.py`.
 
 Inference stacks the members too, so the likelihood scan evaluates all of them
 in one pass over the events instead of M sequential sweeps.

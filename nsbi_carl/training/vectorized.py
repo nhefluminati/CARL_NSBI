@@ -243,7 +243,17 @@ class VectorizedEnsembleTrainer:
         bootstrap_fraction: float = 1.0,
         bootstrap_reference: bool = False,
         model_config=None,
+        train_matrix: np.ndarray | None = None,
+        val_matrix: np.ndarray | None = None,
     ) -> list[dict]:
+        """Train the members of one group.
+
+        By default every member draws its training rows from ``splits.train``
+        (bootstrap or not) and all members share ``splits.val``. k-fold
+        training instead passes ``train_matrix`` / ``val_matrix`` of shape
+        ``(M, n)``: explicit per-member training and validation rows, drawn
+        without replacement, and the bootstrap settings are ignored.
+        """
         cfg = self.config
         dev = self.device
         M = len(member_ids)
@@ -253,9 +263,14 @@ class VectorizedEnsembleTrainer:
         dropout = getattr(model_config, "dropout", 0.0)
 
         labels = dataset.y.numpy().reshape(-1)
-        boot = _member_bootstrap_matrix(
-            splits, labels, seeds, bootstrap_fraction, bootstrap, bootstrap_reference
-        )
+        if train_matrix is not None:
+            boot = np.asarray(train_matrix, dtype=np.int64)
+            if boot.shape[0] != M:
+                raise ValueError(f"train_matrix has {boot.shape[0]} rows for {M} members")
+        else:
+            boot = _member_bootstrap_matrix(
+                splits, labels, seeds, bootstrap_fraction, bootstrap, bootstrap_reference
+            )
         boot_t = torch.as_tensor(boot, dtype=torch.long, device=dev)
         n_train = boot_t.shape[1]
 
@@ -268,8 +283,15 @@ class VectorizedEnsembleTrainer:
         # read-only memory map from the ensemble snapshot, and handing that
         # straight to torch warns about non-writable tensors. The index arrays
         # are small, so the copy is free.
-        val_idx = torch.as_tensor(np.array(splits.val, dtype=np.int64), device=dev)
-        x_val, y_val, w_val = x_all[val_idx], y_all[val_idx], w_all[val_idx]
+        per_member_val = val_matrix is not None
+        if per_member_val:
+            val_np = np.asarray(val_matrix, dtype=np.int64)
+            if val_np.shape[0] != M:
+                raise ValueError(f"val_matrix has {val_np.shape[0]} rows for {M} members")
+            val_t = torch.as_tensor(val_np, dtype=torch.long, device=dev)
+        else:
+            val_idx = torch.as_tensor(np.array(splits.val, dtype=np.int64), device=dev)
+            x_val, y_val, w_val = x_all[val_idx], y_all[val_idx], w_all[val_idx]
 
         # Per-member class rebalancing. The bootstrap resamples the target
         # only, so each member's target carries ~bootstrap_fraction of its
@@ -283,10 +305,19 @@ class VectorizedEnsembleTrainer:
             [rebalance_scale(w_np_all, y_np_all, boot[m]) for m in range(M)],
             dtype=torch.float32, device=dev,
         )
+        # The same balance on each member's own validation rows, so the
+        # early-stopping loss is the loss of a balanced problem too.
+        val_scale = (
+            torch.tensor(
+                [rebalance_scale(w_np_all, y_np_all, val_np[m]) for m in range(M)],
+                dtype=torch.float32, device=dev,
+            )
+            if per_member_val else None
+        )
         if float(tgt_scale.min()) != 1.0 or float(tgt_scale.max()) != 1.0:
             print(
                 f"[{self.run_name}] per-member target weight rescale to restore a 1:1 class "
-                f"balance after the target-only bootstrap: "
+                f"balance after resampling the training rows: "
                 f"{[round(float(v), 6) for v in tgt_scale]}",
                 flush=True,
             )
@@ -304,8 +335,9 @@ class VectorizedEnsembleTrainer:
                 w_rows, y_np_all[rows],
                 tag=f"{self.run_name} member_{member_ids[0]:03d}", split="train",
             )
+            v_rows = val_np[0] if per_member_val else splits.val
             log_weight_summary(
-                w_np_all[splits.val], y_np_all[splits.val], tag=self.run_name, split="val  ",
+                w_np_all[v_rows], y_np_all[v_rows], tag=self.run_name, split="val  ",
                 strict_balance=False,
             )
 
@@ -379,15 +411,32 @@ class VectorizedEnsembleTrainer:
             vnum = torch.zeros(M, device=dev)
             vden = torch.zeros(M, device=dev)
             with torch.no_grad():
-                for s in range(0, x_val.shape[0], cfg.val_batch_size):
-                    xv = x_val[s : s + cfg.val_batch_size]
-                    yv = y_val[s : s + cfg.val_batch_size]
-                    wv = w_val[s : s + cfg.val_batch_size]
-                    with self._autocast():
-                        logits = forward(xv)                     # (M, B) broadcast, no copy
-                    bce = F.binary_cross_entropy_with_logits(logits.float(), yv.expand_as(logits), reduction="none")
-                    vnum += (bce * wv).sum(dim=1)
-                    vden += wv.sum()
+                if per_member_val:
+                    for s in range(0, val_t.shape[1], cfg.val_batch_size):
+                        idx = val_t[:, s : s + cfg.val_batch_size]      # (M, B)
+                        yv = y_all[idx]
+                        wv = w_all[idx] * torch.where(
+                            yv > 0.5, val_scale[:, None], torch.ones_like(val_scale)[:, None]
+                        )
+                        with self._autocast():
+                            logits = forward(x_all[idx])                  # (M, B)
+                        bce = F.binary_cross_entropy_with_logits(
+                            logits.float(), yv, reduction="none"
+                        )
+                        vnum += (bce * wv).sum(dim=1)
+                        vden += wv.sum(dim=1)
+                else:
+                    for s in range(0, x_val.shape[0], cfg.val_batch_size):
+                        xv = x_val[s : s + cfg.val_batch_size]
+                        yv = y_val[s : s + cfg.val_batch_size]
+                        wv = w_val[s : s + cfg.val_batch_size]
+                        with self._autocast():
+                            logits = forward(xv)                     # (M, B) broadcast, no copy
+                        bce = F.binary_cross_entropy_with_logits(
+                            logits.float(), yv.expand_as(logits), reduction="none"
+                        )
+                        vnum += (bce * wv).sum(dim=1)
+                        vden += wv.sum()
             val_loss = vnum / vden
 
             train_hist.append(train_loss.tolist())

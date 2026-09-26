@@ -8,11 +8,21 @@ reproducible in isolation and runs can be extended later.
 * Training reuses :class:`CARLTrainer` per member and adds parallelism: the
   members are distributed round-robin over the configured GPUs with a
   process pool.
-* ``inference(x)`` / ``predict(dataset, idx)`` return the ensembled output:
-  the average of the member predictions.
+* ``inference(x)`` / ``predict(dataset, idx)`` return the ensembled output,
+  combined as ``ensemble.combiner`` says (default: mean of member scores).
 * After training, the *ensemble-level* evaluation suite runs once on the
   test split; the :class:`EvaluationContext` then carries ``member_scores``
   so metrics/plots can use the full ensemble information.
+
+k-fold mode (``split.k_folds: k``) replaces the bootstrap pooling: every event
+is assigned to one of k folds, and fold f gets its own ``n_members`` members,
+each trained on a fresh train/validation split of the other k-1 folds drawn
+WITHOUT replacement. Fold f's members are then the only ones that ever score
+fold f's events (``inference_out_of_fold``), so no event is scored by a
+network that trained on it. The bootstrap settings are ignored in this mode.
+A ``split.kfold_test_fraction`` of every sample is kept out of ALL folds as a
+final test set; no member trains or validates on it, so the whole ensemble
+can be evaluated on it.
 """
 
 from __future__ import annotations
@@ -28,7 +38,9 @@ import torch
 from torch.utils.data import DataLoader, Subset
 
 from ..data.dataset import NSBIDataset, SplitIndices
+from ..data.splitting import DEFAULT_FOLD_SEED, TEST_FOLD, KFoldStep
 from ..evaluation.base import EvaluationContext, EvaluationSuite
+from ..combine import combine_scores
 from ..model import CARL
 from .trainer import CARLTrainer, ModelConfig, TrainerConfig
 
@@ -50,6 +62,29 @@ class EnsembleConfig:
     # "process":    the original one-member-per-process pool.
     mode: str = "vectorized"
     members_per_group: int = 0  # 0 -> all members on a GPU in one group
+
+    # -- how member scores become one score (see nsbi_carl/combine.py) ---
+    combiner: str = "mean_score"   # mean_score | mean_ratio | mean_logit |
+                                   # median_ratio | trimmed_ratio
+    combiner_trim: float = 0.1     # trimmed_ratio: fraction cut at EACH end
+
+    # -- k-fold cross-validation (set from the `split:` config block) -----
+    # k_folds >= 2 switches the bootstrap off: n_members is then the number
+    # of members PER FOLD, and each member trains on a without-replacement
+    # train/val split of the other k-1 folds.
+    k_folds: int = 0
+    fold_seed: int = DEFAULT_FOLD_SEED
+    kfold_val_fraction: float = 0.2
+    kfold_test_fraction: float = 0.1   # untouched final test set (fold -1)
+
+    @property
+    def kfold(self) -> bool:
+        return self.k_folds >= 2
+
+    def kfold_step(self) -> KFoldStep:
+        return KFoldStep(
+            self.k_folds, self.fold_seed, self.kfold_val_fraction, self.kfold_test_fraction
+        )
 
 
 def bootstrap_train_indices(
@@ -132,6 +167,7 @@ def _train_member_worker(
     ensemble_config: dict,
     output_dir: str,
     run_name: str,
+    fold: int | None = None,
 ) -> dict:
     import os
 
@@ -154,20 +190,28 @@ def _train_member_worker(
 
     econf = EnsembleConfig(**ensemble_config)
     labels = dataset.y.numpy().reshape(-1)
-    train_idx = (
-        bootstrap_train_indices(
+    if fold is not None:
+        # k-fold: this member's own without-replacement split of the other
+        # folds; validation on its own val rows, test = the held-out fold.
+        splits = econf.kfold_step().member_indices(dataset, _load_folds(snapshot_path), fold, seed)
+        train_idx = splits.train
+    elif econf.bootstrap:
+        train_idx = bootstrap_train_indices(
             splits, labels, seed, econf.bootstrap_fraction, econf.bootstrap_reference
         )
-        if econf.bootstrap
-        else splits.train
-    )
+    else:
+        train_idx = splits.train
     summary = trainer.fit(dataset, splits, train_idx=train_idx, seed=seed, tag=f"member_{member_id:03d}")
     summary["member"] = member_id
     summary["gpu"] = gpu_id
+    if fold is not None:
+        summary["fold"] = int(fold)
     return summary
 
 
-def _save_snapshot(path: Path, dataset: NSBIDataset, splits: SplitIndices) -> None:
+def _save_snapshot(
+    path: Path, dataset: NSBIDataset, splits: SplitIndices, folds: np.ndarray | None = None
+) -> None:
     """Write the prepared dataset as a directory of plain ``.npy`` files.
 
     ``.npz`` forces every worker to parse and fully materialise its own copy
@@ -190,6 +234,8 @@ def _save_snapshot(path: Path, dataset: NSBIDataset, splits: SplitIndices) -> No
         "val": splits.val,
         "test": splits.test,
     }
+    if folds is not None:
+        arrays["folds"] = np.asarray(folds, dtype=np.int16)
     for name, arr in arrays.items():
         np.save(path / f"{name}.npy", arr)
     with open(path / "names.json", "w") as f:
@@ -214,6 +260,13 @@ def _load_snapshot(path: str) -> tuple[NSBIDataset, SplitIndices]:
     )
 
 
+def _load_folds(path: str) -> np.ndarray:
+    p = Path(path) / "folds.npy"
+    if not p.exists():
+        raise FileNotFoundError(f"k-fold training needs {p}; the snapshot was written without folds")
+    return np.array(np.load(p))
+
+
 # ---------------------------------------------------------------------------
 def _train_group_worker(
     snapshot_path: str,
@@ -225,8 +278,13 @@ def _train_group_worker(
     ensemble_config: dict,
     output_dir: str,
     run_name: str,
+    fold: int | None = None,
 ) -> list[dict]:
-    """Train a whole group of members together, vectorized, on one GPU."""
+    """Train a whole group of members together, vectorized, on one GPU.
+
+    With ``fold`` set (k-fold mode) every member of the group belongs to that
+    fold and gets its own without-replacement train/val rows.
+    """
     import os
 
     for var in ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS"):
@@ -264,7 +322,15 @@ def _train_group_worker(
     trainer = VectorizedEnsembleTrainer(
         config=vconf, output_dir=output_dir, run_name=run_name, device=device
     )
-    return trainer.train(
+    train_matrix = val_matrix = None
+    if fold is not None:
+        folds = _load_folds(snapshot_path)
+        step = econf.kfold_step()
+        member_splits = [step.member_indices(dataset, folds, fold, s) for s in seeds]
+        train_matrix = np.stack([m.train for m in member_splits])
+        val_matrix = np.stack([m.val for m in member_splits])
+        splits = member_splits[0]
+    summaries = trainer.train(
         dataset,
         splits,
         member_ids=list(member_ids),
@@ -273,7 +339,21 @@ def _train_group_worker(
         bootstrap_fraction=econf.bootstrap_fraction,
         bootstrap_reference=econf.bootstrap_reference,
         model_config=ModelConfig(**model_config),
+        train_matrix=train_matrix,
+        val_matrix=val_matrix,
     )
+    if fold is not None:
+        for s in summaries:
+            s["fold"] = int(fold)
+    return summaries
+
+
+def _run_jobs_sequentially(jobs: list[dict], common: dict) -> list[dict]:
+    """Run several group jobs one after another in one process (one GPU)."""
+    out: list[dict] = []
+    for job in jobs:
+        out.extend(_train_group_worker(**job, **common))
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -293,14 +373,19 @@ class CARLEnsemble:
         self.manifest: dict = {}
         self._stacked = None
         self._stacked_device: str | None = None
+        self._fold_stacks: dict = {}
 
     @property
     def manifest_path(self) -> Path:
         return self.output_dir / f"ensemble_manifest_{self.run_name}.json"
 
     # -- training -------------------------------------------------------
-    def train(self, dataset: NSBIDataset, splits: SplitIndices) -> list[dict]:
+    def train(
+        self, dataset: NSBIDataset, splits: SplitIndices, folds: np.ndarray | None = None
+    ) -> list[dict]:
         cfg = self.config
+        if cfg.kfold and folds is None:
+            raise ValueError("k-fold ensemble training needs the per-event fold array")
         member_ids = list(range(cfg.start_member, cfg.n_members))
         if not member_ids:
             return self._merge_manifest([])
@@ -308,7 +393,7 @@ class CARLEnsemble:
         gpus = self.trainer.config.gpus or [None]
         snapshot = self.output_dir / f"dataset_snapshot_{self.run_name}"
         self.output_dir.mkdir(parents=True, exist_ok=True)
-        _save_snapshot(snapshot, dataset, splits)
+        _save_snapshot(snapshot, dataset, splits, folds if cfg.kfold else None)
 
         common = dict(
             snapshot_path=str(snapshot),
@@ -319,7 +404,11 @@ class CARLEnsemble:
             run_name=self.run_name,
         )
 
-        if cfg.mode == "vectorized":
+        if cfg.kfold and cfg.mode == "vectorized":
+            summaries = self._train_kfold_vectorized(member_ids, gpus, common)
+        elif cfg.kfold:
+            summaries = self._train_kfold_process_pool(member_ids, gpus, common)
+        elif cfg.mode == "vectorized":
             summaries = self._train_vectorized(member_ids, gpus, common)
         else:
             summaries = self._train_process_pool(member_ids, gpus, common)
@@ -391,6 +480,75 @@ class CARLEnsemble:
             ]
             return [f.result() for f in futures]
 
+    # -- k-fold -----------------------------------------------------------
+    def fold_member_id(self, fold: int, member: int) -> int:
+        """Global member id (and seed offset) of ``member`` in ``fold``."""
+        return fold * self.config.n_members + member
+
+    def _train_kfold_vectorized(self, member_ids: list[int], gpus: list, common: dict) -> list[dict]:
+        """One vectorized group per fold (split by ``members_per_group``).
+
+        Folds are dealt round-robin to the GPUs, and each GPU works through
+        its folds one after another, so at most one group per GPU is resident.
+        """
+        cfg = self.config
+        size = cfg.members_per_group or len(member_ids)
+        jobs = []
+        for fold in range(cfg.k_folds):
+            gids = [self.fold_member_id(fold, m) for m in member_ids]
+            for s in range(0, len(gids), size):
+                chunk = gids[s : s + size]
+                jobs.append(dict(member_ids=chunk, seeds=[cfg.start_seed + g for g in chunk],
+                                 fold=fold))
+        per_gpu: dict[int, list[dict]] = {i: [] for i in range(len(gpus))}
+        for i, job in enumerate(jobs):
+            slot = i % len(gpus)
+            per_gpu[slot].append({**job, "gpu_id": gpus[slot]})
+
+        work = [js for js in per_gpu.values() if js]
+        if len(work) <= 1:
+            return _run_jobs_sequentially(work[0], common) if work else []
+        ctx = torch.multiprocessing.get_context("spawn")
+        with ProcessPoolExecutor(max_workers=len(work), mp_context=ctx) as pool:
+            futures = [pool.submit(_run_jobs_sequentially, js, common) for js in work]
+            out: list[dict] = []
+            for fut in futures:
+                out.extend(fut.result())
+        return out
+
+    def _train_kfold_process_pool(self, member_ids: list[int], gpus: list, common: dict) -> list[dict]:
+        cfg = self.config
+        gpu_slots = [g for g in gpus for _ in range(cfg.workers_per_gpu)]
+        assignments = []
+        for fold in range(cfg.k_folds):
+            for m in member_ids:
+                gid = self.fold_member_id(fold, m)
+                assignments.append((gid, cfg.start_seed + gid, fold))
+        max_workers = min(len(assignments), len(gpu_slots))
+        if max_workers <= 1:
+            return [
+                _train_member_worker(member_id=g, seed=s, gpu_id=gpu_slots[0], fold=f, **common)
+                for g, s, f in assignments
+            ]
+        ctx = torch.multiprocessing.get_context("spawn")
+        with ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as pool:
+            futures = [
+                pool.submit(_train_member_worker, member_id=g, seed=s,
+                            gpu_id=gpu_slots[i % len(gpu_slots)], fold=f, **common)
+                for i, (g, s, f) in enumerate(assignments)
+            ]
+            return [fut.result() for fut in futures]
+
+    def fold_members(self) -> list[list[int]]:
+        """Indices into ``self.models`` of each fold's members, fold by fold."""
+        members = self.manifest.get("members", [])
+        out: list[list[int]] = [[] for _ in range(self.config.k_folds)]
+        for i, m in enumerate(members):
+            if "fold" not in m:
+                raise ValueError(f"manifest member {m.get('member')} carries no fold")
+            out[int(m["fold"])].append(i)
+        return out
+
     def _merge_manifest(self, new_summaries: list[dict]) -> list[dict]:
         members: dict[int, dict] = {}
         if self.manifest_path.exists():  # keep previously trained members
@@ -399,6 +557,13 @@ class CARLEnsemble:
         members.update({s["member"]: s for s in new_summaries})
         ordered = [members[k] for k in sorted(members)]
         self.manifest = {"run_name": self.run_name, "n_members": len(ordered), "members": ordered}
+        if self.config.kfold:
+            self.manifest.update(
+                k_folds=self.config.k_folds,
+                fold_seed=self.config.fold_seed,
+                kfold_test_fraction=self.config.kfold_test_fraction,
+                members_per_fold=self.config.n_members,
+            )
         with open(self.manifest_path, "w") as f:
             json.dump(self.manifest, f, indent=2)
         return ordered
@@ -412,17 +577,24 @@ class CARLEnsemble:
             for m in self.manifest["members"]
         ]
         self._stacked, self._stacked_device = None, None
+        self._fold_stacks = {}
         return self
 
     @torch.no_grad()
     def member_predictions(self, x: torch.Tensor | np.ndarray, device: str | None = None,
-                           batch_size: int = 262144, stacked: bool = True) -> np.ndarray:
+                           batch_size: int | None = None, stacked: bool = True,
+                           mem_fraction: float = 0.5) -> np.ndarray:
         """(n_members, n_events) matrix of member scores for SCALED features.
 
         With ``stacked`` (the default) the members are fused into a single
         batched module and every member is evaluated in the same pass, which
         is what the likelihood scan wants: it turns M sequential sweeps over
         the events into one. The per-model loop is kept as a fallback.
+
+        ``batch_size=None`` sizes the event chunk from the free GPU memory and
+        the ensemble size: the stacked forward keeps ``(M, B, n_nodes)``
+        activations alive, so a fixed chunk that fits a small ensemble runs
+        out of memory for a large one.
         """
         if not self.models:
             self.load()
@@ -431,12 +603,15 @@ class CARLEnsemble:
 
         if stacked and len(self.models) > 1:
             model = self.stacked(device=device)
+            if batch_size is None:
+                batch_size = self._auto_batch_size(model, device, mem_fraction)
             out = [
                 torch.sigmoid(model(x[i : i + batch_size].to(device))).cpu()
                 for i in range(0, len(x), batch_size)
             ]
             return torch.cat(out, dim=1).numpy()
 
+        batch_size = batch_size or 65536
         preds = []
         for model in self.models:
             model = model.to(device).eval()
@@ -445,51 +620,141 @@ class CARLEnsemble:
             model.to("cpu")
         return np.stack(preds)
 
+    @staticmethod
+    def _auto_batch_size(model, device: str | torch.device, mem_fraction: float = 0.5) -> int:
+        """Largest event chunk whose ``(M, B, H)`` activations fit in free GPU memory."""
+        dev = torch.device(device)
+        if dev.type != "cuda":
+            return 65536
+        torch.cuda.empty_cache()
+        free, _ = torch.cuda.mem_get_info(dev)
+        width = max(model.n_nodes, model.n_features)
+        per_event = 3 * model.n_members * width * 4  # ~3 live fp32 (M, B, H) tensors per layer
+        return int(max(1024, min(262144, mem_fraction * free // per_event)))
+
     def stacked(self, device: str | torch.device = "cpu"):
         """Fuse the loaded members into one :class:`StackedMLP` for inference."""
-        from .vectorized import StackedMLP
-
         if self._stacked is not None and self._stacked_device == str(device):
             return self._stacked
         if not self.models:
             self.load()
-
-        hp = self.models[0].hparams
-        model = StackedMLP(
-            n_members=len(self.models),
-            n_features=hp["n_features"],
-            n_layers=hp["n_layers"],
-            n_nodes=hp["n_nodes"],
-            dropout=hp.get("dropout", 0.0),
-        )
-        stride = 3 if hp.get("dropout", 0.0) > 0.0 else 2
-        with torch.no_grad():
-            for m, member in enumerate(self.models):
-                sd = member.state_dict()
-                for layer in range(len(model.weights)):
-                    idx = layer * stride
-                    model.weights[layer][m].copy_(sd[f"net.{idx}.weight"].t())
-                    model.biases[layer][m, 0].copy_(sd[f"net.{idx}.bias"])
-        model = model.to(device).eval()
+        model = stack_members(self.models, device)
         self._stacked, self._stacked_device = model, str(device)
         return model
 
+    # -- k-fold inference -------------------------------------------------
+    @torch.no_grad()
+    def out_of_fold_member_predictions(
+        self, x: torch.Tensor | np.ndarray, folds: np.ndarray, device: str | None = None,
+        batch_size: int = 262144,
+    ) -> np.ndarray:
+        """``(members_per_fold, n_events)`` scores for SCALED features, where
+        column i comes only from the members of event i's own fold -- the
+        networks that never trained on it. Row m is member m of that fold."""
+        if not self.config.kfold:
+            raise ValueError("out-of-fold prediction needs a k-fold ensemble")
+        if not self.models:
+            self.load()
+        device = device or ("cuda:0" if torch.cuda.is_available() else "cpu")
+        per_fold = self.fold_members()
+        sizes = {len(p) for p in per_fold}
+        if len(sizes) != 1 or 0 in sizes:
+            raise ValueError(f"folds have unequal/empty member counts {[len(p) for p in per_fold]}")
+        x = torch.as_tensor(x, dtype=torch.float32)
+        folds = np.asarray(folds).reshape(-1)
+        if np.any(folds == TEST_FOLD):
+            raise ValueError(
+                "events of the untouched test set (fold -1) have no 'own fold'; every member "
+                "is out-of-sample for them, so score them with member_predictions()/inference()"
+            )
+        out = np.empty((sizes.pop(), len(x)), dtype=np.float32)
+        for f, members in enumerate(per_fold):
+            sel = np.flatnonzero(folds == f)
+            if sel.size == 0:
+                continue
+            key = (f, str(device))
+            if key not in self._fold_stacks:
+                self._fold_stacks[key] = stack_members([self.models[i] for i in members], device)
+            model = self._fold_stacks[key]
+            xs = x[torch.as_tensor(sel)]
+            out[:, sel] = torch.cat(
+                [torch.sigmoid(model(xs[i : i + batch_size].to(device))).cpu()
+                 for i in range(0, len(xs), batch_size)], dim=1
+            ).numpy()
+        return out
+
+    def inference_out_of_fold(self, x, folds, device: str | None = None) -> np.ndarray:
+        """Combined score of every event using only networks that never saw it:
+        its own fold's members, or ALL members for the test set (fold -1)."""
+        folds = np.asarray(folds).reshape(-1)
+        out = np.empty(len(folds), dtype=np.float64)
+        test = folds == TEST_FOLD
+        x = np.asarray(x)
+        if test.any():
+            out[test] = self.inference(x[test], device=device)
+        if (~test).any():
+            out[~test] = combine_scores(
+                self.out_of_fold_member_predictions(x[~test], folds[~test], device=device),
+                self.config.combiner, self.config.combiner_trim,
+            )
+        return out
+
     def inference(self, x: torch.Tensor | np.ndarray, device: str | None = None) -> np.ndarray:
-        """Ensembled output: average of all member predictions."""
-        return self.member_predictions(x, device=device).mean(axis=0)
+        """Ensembled output, combined per ``EnsembleConfig.combiner``."""
+        return combine_scores(self.member_predictions(x, device=device),
+                              self.config.combiner, self.config.combiner_trim)
 
     __call__ = inference
 
     # -- ensemble-level evaluation ---------------------------------------
     def evaluate(self, dataset: NSBIDataset, idx: np.ndarray, tag: str = "ensemble_test",
-                 device: str | None = None) -> dict[str, float]:
+                 device: str | None = None, folds: np.ndarray | None = None) -> dict:
+        """Run the after-training suite on ``idx``.
+
+        k-fold mode (pass ``folds``, and usually every event as ``idx``) runs
+        it twice:
+
+        * ``<tag>`` on the untouched test set (fold -1), scored by the WHOLE
+          ensemble -- no member ever trained or validated on these events;
+        * ``<tag>_out_of_fold`` on the cross-validated events, each scored by
+          its own fold's members only.
+
+        and returns ``{"test": ..., "out_of_fold": ...}``.
+        """
+        if self.config.kfold:
+            if folds is None:
+                raise ValueError("k-fold evaluation needs the per-event fold array")
+            idx = np.asarray(idx)
+            f = np.asarray(folds)[idx]
+            results: dict = {}
+            test_idx, cv_idx = idx[f == TEST_FOLD], idx[f != TEST_FOLD]
+            if test_idx.size:
+                results["test"] = self._run_suite(
+                    dataset, test_idx,
+                    self.member_predictions(dataset.x.numpy()[test_idx], device=device), tag,
+                )
+            if cv_idx.size:
+                results["out_of_fold"] = self._run_suite(
+                    dataset, cv_idx,
+                    self.out_of_fold_member_predictions(
+                        dataset.x.numpy()[cv_idx], np.asarray(folds)[cv_idx], device=device
+                    ),
+                    f"{tag}_out_of_fold",
+                )
+            return results
+
         member_scores = self.member_predictions(dataset.x.numpy()[idx], device=device)
+        return self._run_suite(dataset, idx, member_scores, tag)
+
+    def _run_suite(self, dataset: NSBIDataset, idx: np.ndarray, member_scores: np.ndarray,
+                   tag: str) -> dict:
         histories = [
             {"member": m["member"], "train_loss": m["train_loss"], "val_loss": m["val_loss"]}
             for m in self.manifest.get("members", [])
         ]
         ctx = EvaluationContext(
-            scores=member_scores.mean(axis=0).astype(np.float64),
+            scores=combine_scores(member_scores, self.config.combiner,
+                                  self.config.combiner_trim).astype(np.float64),
             labels=dataset.y.numpy().reshape(-1)[idx],
             weights=dataset.w.numpy().reshape(-1)[idx].astype(np.float64),
             features=dataset.x.numpy()[idx],
@@ -508,3 +773,26 @@ class CARLEnsemble:
             with open(out / f"metrics_{tag}.json", "w") as f:
                 json.dump(results, f, indent=2)
         return results
+
+
+def stack_members(models: list, device: str | torch.device = "cpu"):
+    """Fuse CARL members into one :class:`StackedMLP` (one pass for all)."""
+    from .vectorized import StackedMLP
+
+    hp = models[0].hparams
+    model = StackedMLP(
+        n_members=len(models),
+        n_features=hp["n_features"],
+        n_layers=hp["n_layers"],
+        n_nodes=hp["n_nodes"],
+        dropout=hp.get("dropout", 0.0),
+    )
+    stride = 3 if hp.get("dropout", 0.0) > 0.0 else 2
+    with torch.no_grad():
+        for m, member in enumerate(models):
+            sd = member.state_dict()
+            for layer in range(len(model.weights)):
+                idx = layer * stride
+                model.weights[layer][m].copy_(sd[f"net.{idx}.weight"].t())
+                model.biases[layer][m, 0].copy_(sd[f"net.{idx}.bias"])
+    return model.to(device).eval()
