@@ -43,7 +43,7 @@ class TrainerConfig:
     device_batches: bool = True       # keep the split on the GPU, skip DataLoader
     matmul_precision: str = "high"    # "highest" | "high" | "medium"  (TF32)
     compile: bool = False             # torch.compile the network
-    optimizer: str = "sgd"            # "sgd" | "adam" | "adamw"
+    optimizer: str = "sgd"            # "sgd" | "adam" | "adamw" | "nadam"
     weight_decay: float = 0.0
     save_last: bool = False           # writing last.ckpt every epoch is pure IO
     checkpoint_every_n_epochs: int = 1

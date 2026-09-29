@@ -225,8 +225,11 @@ one score: `mean_score` (default, the historical behaviour), `mean_ratio`,
 averaging scores gives a smaller ratio than averaging ratios wherever the
 members disagree, which is typically where the reference is thin. The choice
 is stored in the run record and picked up by `EnsembleScorer`; override it at
-analysis time with `EnsembleScorer(record, combiner="mean_ratio")` or
+analysis time with `EnsembleScorer(record, combiner="mean_logit")` or
 `scorer.set_combiner(...)` — no retraining needed. See `nsbi_carl/combine.py`.
+Beware `mean_ratio`: it is unbounded, so a single member whose sigmoid
+saturates (s = 1.0 in float32 already at logit ~17) sets the ensemble ratio
+for that event on its own; it warns when that happens.
 
 Inference stacks the members too, so the likelihood scan evaluates all of them
 in one pass over the events instead of M sequential sweeps.

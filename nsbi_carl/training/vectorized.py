@@ -218,19 +218,14 @@ class VectorizedEnsembleTrainer:
         return torch.autocast("cuda", dtype=dtype)
 
     def _build_optimizer(self, model: nn.Module):
+        from ..model import build_optimizer
+
         cfg = self.config
-        name = cfg.optimizer.lower()
-        if name == "sgd":
-            return torch.optim.SGD(
-                model.parameters(), lr=cfg.learning_rate, momentum=cfg.momentum,
-                weight_decay=cfg.weight_decay, foreach=True,
-            )
-        cls = torch.optim.AdamW if name == "adamw" else torch.optim.Adam
-        kwargs = dict(lr=cfg.learning_rate, weight_decay=cfg.weight_decay)
-        try:
-            return cls(model.parameters(), fused=True, **kwargs)
-        except (RuntimeError, TypeError):
-            return cls(model.parameters(), foreach=True, **kwargs)
+        # Previously any name other than sgd/adamw silently became Adam here.
+        return build_optimizer(
+            model.parameters(), name=cfg.optimizer, lr=cfg.learning_rate,
+            momentum=cfg.momentum, weight_decay=cfg.weight_decay,
+        )
 
     # ------------------------------------------------------------------
     def train(

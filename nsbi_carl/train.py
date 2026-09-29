@@ -15,8 +15,19 @@ def main() -> None:
     result = Pipeline.from_yaml(args.config).run()
     if "metrics" in result:
         print("Final ensemble metrics:")
-        for k, v in result["metrics"].items():
-            print(f"  {k}: {v:.6f}")
+        _print_metrics(result["metrics"])
+
+
+def _print_metrics(metrics: dict, indent: str = "  ") -> None:
+    """Flat for a fixed-split run; nested {"test": .., "out_of_fold": ..} for k-fold."""
+    for k, v in (metrics or {}).items():
+        if isinstance(v, dict):
+            print(f"{indent}{k}:")
+            _print_metrics(v, indent + "  ")
+        elif isinstance(v, (int, float)):
+            print(f"{indent}{k}: {v:.6f}")
+        else:
+            print(f"{indent}{k}: {v}")
 
 
 if __name__ == "__main__":

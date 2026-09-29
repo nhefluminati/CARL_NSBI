@@ -34,6 +34,7 @@ from .evaluation import base as _eval_base
 from .evaluation import metrics as _metrics  # noqa: F401  (populate registries)
 from .evaluation import plots as _plots      # noqa: F401
 from .training.ensemble import CARLEnsemble, EnsembleConfig
+from .model import validate_optimizer
 from .training.trainer import CARLTrainer, ModelConfig, TrainerConfig
 
 
@@ -108,7 +109,7 @@ class Pipeline:
                 num_workers=train_cfg.get("num_workers", 4),
                 gpus=train_cfg.get("gpus", []) or [],
                 resume_from=train_cfg.get("resume_from"),
-                optimizer=train_cfg.get("optimizer", "sgd"),
+                optimizer=validate_optimizer(train_cfg.get("optimizer", "sgd")),
                 weight_decay=train_cfg.get("weight_decay", 0.0),
                 precision=perf_cfg.get("precision", "32-true"),
                 device_batches=perf_cfg.get("device_batches", True),

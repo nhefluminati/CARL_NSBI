@@ -10,7 +10,12 @@ and the true ratio is large, so the choice decides how those regions come out.
 Available combiners (``ensemble.combiner`` in the pipeline config):
 
 ``mean_score``    mean of s_m, then r = s/(1-s). The historical behaviour.
-``mean_ratio``    arithmetic mean of r_m. Unbiased for r if each member is.
+``mean_ratio``    arithmetic mean of r_m. Unbiased for r if each member is,
+                  but UNBOUNDED: one overconfident member (s_m -> 1, e.g. a
+                  float32 sigmoid rounding to exactly 1.0) sets r ~ r_m / M
+                  for that event, however many members disagree. A warning
+                  is raised when that happens; prefer ``mean_logit`` or
+                  ``trimmed_ratio`` if you want to average in ratio space.
 ``mean_logit``    mean of log r_m, i.e. the geometric mean of the ratios.
                   Symmetric in r <-> 1/r; the natural average for a quantity
                   whose error is multiplicative.
@@ -28,11 +33,16 @@ E_ref[r] = 1 by construction; check (and correct) it downstream as before.
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 
 COMBINERS = ("mean_score", "mean_ratio", "mean_logit", "median_ratio", "trimmed_ratio")
 DEFAULT_COMBINER = "mean_score"
 _EPS = 1e-12
+# mean_ratio: warn when a single member's ratio is this many times the
+# event's median member ratio -- that member alone then sets the mean.
+_OUTLIER_FACTOR = 1e3
 
 
 def validate_combiner(name: str, trim: float = 0.0) -> str:
@@ -65,8 +75,25 @@ def combine_scores(
     r = s / (1.0 - s)
     if combiner == "mean_ratio":
         r_bar = r.mean(axis=0)
+        _warn_dominated(r, r_bar)
     else:  # trimmed_ratio
         k = int(np.floor(trim * r.shape[0]))
         r_sorted = np.sort(r, axis=0)
         r_bar = r_sorted[k : r.shape[0] - k].mean(axis=0)
     return r_bar / (1.0 + r_bar)
+
+
+def _warn_dominated(r: np.ndarray, r_bar: np.ndarray) -> None:
+    """Warn if single members dominate the arithmetic mean of the ratios."""
+    med = np.median(r, axis=0)
+    bad = r.max(axis=0) > _OUTLIER_FACTOR * np.maximum(med, _EPS)
+    if bad.any():
+        worst = float(np.max(r_bar[bad] / np.maximum(med[bad], _EPS)))
+        warnings.warn(
+            f"mean_ratio: in {int(bad.sum())}/{bad.size} events one member's ratio exceeds "
+            f"{_OUTLIER_FACTOR:.0e}x the median member's, so that member alone sets the "
+            f"ensemble ratio (worst: mean/median = {worst:.3g}). These are usually members "
+            "whose sigmoid saturated. Use mean_logit, trimmed_ratio or median_ratio instead.",
+            RuntimeWarning,
+            stacklevel=3,
+        )

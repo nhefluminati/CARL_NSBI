@@ -388,6 +388,12 @@ class CARLEnsemble:
             raise ValueError("k-fold ensemble training needs the per-event fold array")
         member_ids = list(range(cfg.start_member, cfg.n_members))
         if not member_ids:
+            print(
+                f"[{self.run_name}] start_member={cfg.start_member} >= n_members="
+                f"{cfg.n_members}: nothing to train; evaluating the members already in "
+                f"{self.manifest_path}",
+                flush=True,
+            )
             return self._merge_manifest([])
 
         gpus = self.trainer.config.gpus or [None]
@@ -404,6 +410,8 @@ class CARLEnsemble:
             run_name=self.run_name,
         )
 
+        if cfg.kfold and cfg.start_member > 0:
+            self._check_extendable()
         if cfg.kfold and cfg.mode == "vectorized":
             summaries = self._train_kfold_vectorized(member_ids, gpus, common)
         elif cfg.kfold:
@@ -481,9 +489,31 @@ class CARLEnsemble:
             return [f.result() for f in futures]
 
     # -- k-fold -----------------------------------------------------------
+    # Member ids (and seed offsets) of fold f are f*FOLD_ID_STRIDE + m. A fixed
+    # stride, not n_members, so that raising n_members to extend an existing
+    # k-fold ensemble cannot give new members of fold f the ids of fold f+1.
+    FOLD_ID_STRIDE = 1000
+
     def fold_member_id(self, fold: int, member: int) -> int:
         """Global member id (and seed offset) of ``member`` in ``fold``."""
-        return fold * self.config.n_members + member
+        if member >= self.FOLD_ID_STRIDE:
+            raise ValueError(f"at most {self.FOLD_ID_STRIDE} members per fold")
+        return fold * self.FOLD_ID_STRIDE + member
+
+    def _check_extendable(self) -> None:
+        """Refuse to extend a k-fold run whose ids used the old n_members stride."""
+        if not self.manifest_path.exists():
+            return
+        with open(self.manifest_path) as fh:
+            old = json.load(fh)
+        if not old.get("k_folds") or not old.get("members"):
+            return
+        if old.get("id_stride") != self.FOLD_ID_STRIDE:
+            raise ValueError(
+                f"{self.manifest_path} was written with member ids fold*n_members+m; "
+                "extending it (start_member > 0) would collide ids across folds. "
+                "Retrain from start_member: 0 in a fresh output_dir."
+            )
 
     def _train_kfold_vectorized(self, member_ids: list[int], gpus: list, common: dict) -> list[dict]:
         """One vectorized group per fold (split by ``members_per_group``).
@@ -554,6 +584,13 @@ class CARLEnsemble:
         if self.manifest_path.exists():  # keep previously trained members
             with open(self.manifest_path) as f:
                 members = {m["member"]: m for m in json.load(f)["members"]}
+        for s in new_summaries:
+            prev = members.get(s["member"])
+            if prev is not None and prev.get("fold") != s.get("fold"):
+                raise RuntimeError(
+                    f"member id {s['member']} already belongs to fold {prev.get('fold')}; "
+                    f"refusing to overwrite it with a member of fold {s.get('fold')}"
+                )
         members.update({s["member"]: s for s in new_summaries})
         ordered = [members[k] for k in sorted(members)]
         self.manifest = {"run_name": self.run_name, "n_members": len(ordered), "members": ordered}
@@ -563,6 +600,7 @@ class CARLEnsemble:
                 fold_seed=self.config.fold_seed,
                 kfold_test_fraction=self.config.kfold_test_fraction,
                 members_per_fold=self.config.n_members,
+                id_stride=self.FOLD_ID_STRIDE,
             )
         with open(self.manifest_path, "w") as f:
             json.dump(self.manifest, f, indent=2)
@@ -646,7 +684,7 @@ class CARLEnsemble:
     @torch.no_grad()
     def out_of_fold_member_predictions(
         self, x: torch.Tensor | np.ndarray, folds: np.ndarray, device: str | None = None,
-        batch_size: int = 262144,
+        batch_size: int | None = None, mem_fraction: float = 0.5,
     ) -> np.ndarray:
         """``(members_per_fold, n_events)`` scores for SCALED features, where
         column i comes only from the members of event i's own fold -- the
@@ -676,10 +714,11 @@ class CARLEnsemble:
             if key not in self._fold_stacks:
                 self._fold_stacks[key] = stack_members([self.models[i] for i in members], device)
             model = self._fold_stacks[key]
+            bs = batch_size or self._auto_batch_size(model, device, mem_fraction)
             xs = x[torch.as_tensor(sel)]
             out[:, sel] = torch.cat(
-                [torch.sigmoid(model(xs[i : i + batch_size].to(device))).cpu()
-                 for i in range(0, len(xs), batch_size)], dim=1
+                [torch.sigmoid(model(xs[i : i + bs].to(device))).cpu()
+                 for i in range(0, len(xs), bs)], dim=1
             ).numpy()
         return out
 

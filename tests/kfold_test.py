@@ -227,10 +227,24 @@ def main():
 
         # -- 6) process mode trains too ------------------------------------
         cfg = config(tmp, "Sp", "S.h5", mode="process", load_reference=cache)
-        cfg["ensemble"]["n_members"] = 1
+        cfg["ensemble"].update(n_members=1, workers_per_gpu=2)
+        cfg["training"]["optimizer"] = "nadam"
         resP = Pipeline(cfg).run()
         assert sorted(s["fold"] for s in resP["summaries"]) == list(range(K))
-        ok.append("process mode trains one member per fold")
+        ok.append("process mode (2 workers, NAdam) trains one member per fold")
+
+        # -- 6b) extending a k-fold ensemble keeps every fold's members -----
+        cfg = config(tmp, "B", "B.h5", seed=15, load_reference=cache)
+        cfg["ensemble"].update(n_members=3, start_member=2)
+        resX = Pipeline(cfg).run()
+        by_fold = {}
+        for s in resX["summaries"]:
+            by_fold.setdefault(s["fold"], []).append(s["member"])
+        assert sorted(by_fold) == list(range(K)) and all(len(v) == 3 for v in by_fold.values()), by_fold
+        assert len({m for v in by_fold.values() for m in v}) == 3 * K, "member ids collided"
+        recX = read_record(tmp / "B", "B")
+        assert [len(m) for m in recX.fold_members] == [3] * K
+        ok.append("extending n_members 2 -> 3 adds one member per fold without id collisions")
 
         # -- 7) k-fold without an ensemble is rejected ----------------------
         cfg = config(tmp, "X", "S.h5", load_reference=cache)

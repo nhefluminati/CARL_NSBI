@@ -58,6 +58,21 @@ def test_trimmed_ratio_limits():
     assert np.all(tr < 1e3)
 
 
+def test_saturated_member():
+    """One float32-saturated member out of 40: mean_ratio explodes (and warns),
+    the robust combiners do not."""
+    import warnings as _w
+    s = np.full((40, 1), 0.3, dtype=np.float32)
+    s[0] = np.float32(1.0)                   # sigmoid(20) in float32 is exactly 1.0
+    with _w.catch_warnings(record=True) as caught:
+        _w.simplefilter("always")
+        r_mean = _r(combine.combine_scores(s, "mean_ratio"))[0]
+    assert r_mean > 1e9
+    assert any("mean_ratio" in str(c.message) for c in caught), "no warning"
+    for c in ("median_ratio", "trimmed_ratio", "mean_score"):
+        assert _r(combine.combine_scores(s, c))[0] < 1.0, c
+
+
 def test_rejects_unknown():
     for bad in (("mean", 0.1), ("trimmed_ratio", 0.5)):
         try:

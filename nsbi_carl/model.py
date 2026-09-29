@@ -193,27 +193,13 @@ class CARL(L.LightningModule):
 
     # ------------------------------------------------------------------
     def configure_optimizers(self):
-        name = str(getattr(self.hparams, "optimizer", "sgd")).lower()
-        wd = float(getattr(self.hparams, "weight_decay", 0.0))
-        if name == "sgd":
-            optimizer = torch.optim.SGD(
-                self.parameters(),
-                lr=self.hparams.learning_rate,
-                momentum=self.hparams.momentum,
-                weight_decay=wd,
-                foreach=True,
-            )
-        elif name in ("adam", "adamw"):
-            cls = torch.optim.AdamW if name == "adamw" else torch.optim.Adam
-            # `fused` keeps the whole step on the GPU; it is a large win for
-            # small models where the optimizer step rivals the forward pass.
-            kwargs = dict(lr=self.hparams.learning_rate, weight_decay=wd)
-            try:
-                optimizer = cls(self.parameters(), fused=True, **kwargs)
-            except (RuntimeError, TypeError):
-                optimizer = cls(self.parameters(), foreach=True, **kwargs)
-        else:
-            raise ValueError(f"Unknown optimizer {name!r}; use 'sgd', 'adam' or 'adamw'.")
+        optimizer = build_optimizer(
+            self.parameters(),
+            name=str(getattr(self.hparams, "optimizer", "sgd")),
+            lr=self.hparams.learning_rate,
+            momentum=self.hparams.momentum,
+            weight_decay=float(getattr(self.hparams, "weight_decay", 0.0)),
+        )
 
         scheduler = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
             optimizer,
@@ -225,3 +211,33 @@ class CARL(L.LightningModule):
             "optimizer": optimizer,
             "lr_scheduler": {"scheduler": scheduler, "interval": "epoch", "frequency": 1},
         }
+
+
+OPTIMIZERS = ("sgd", "adam", "adamw", "nadam")
+
+
+def validate_optimizer(name: str) -> str:
+    key = str(name).lower()
+    if key not in OPTIMIZERS:
+        raise ValueError(f"Unknown optimizer {name!r}; use one of {OPTIMIZERS}.")
+    return key
+
+
+def build_optimizer(params, name: str, lr: float, momentum: float = 0.0,
+                    weight_decay: float = 0.0):
+    """One optimizer factory for the Lightning and the vectorized trainers,
+    so a name can never mean different things in the two paths."""
+    name = validate_optimizer(name)
+    params = list(params)
+    if name == "sgd":
+        return torch.optim.SGD(params, lr=lr, momentum=momentum,
+                               weight_decay=weight_decay, foreach=True)
+    cls = {"adam": torch.optim.Adam, "adamw": torch.optim.AdamW,
+           "nadam": torch.optim.NAdam}[name]   # NAdam: as in the ATLAS NSBI analysis
+    kwargs = dict(lr=lr, weight_decay=weight_decay)
+    # `fused` keeps the whole step on the GPU (a large win for small models);
+    # fall back to `foreach` where the optimizer or device has no fused kernel.
+    try:
+        return cls(params, fused=True, **kwargs)
+    except (RuntimeError, TypeError, ValueError):
+        return cls(params, foreach=True, **kwargs)
