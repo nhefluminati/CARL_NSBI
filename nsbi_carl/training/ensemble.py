@@ -62,6 +62,10 @@ class EnsembleConfig:
     # "process":    the original one-member-per-process pool.
     mode: str = "vectorized"
     members_per_group: int = 0  # 0 -> all members on a GPU in one group
+    # k-fold + vectorized only: stack members of DIFFERENT folds into the same
+    # group instead of training the folds one group after another. All k folds
+    # then train in one pass per GPU (split by members_per_group).
+    kfold_stack_folds: bool = False
 
     # -- how member scores become one score (see nsbi_carl/combine.py) ---
     combiner: str = "mean_score"   # mean_score | mean_ratio | mean_logit |
@@ -279,11 +283,14 @@ def _train_group_worker(
     output_dir: str,
     run_name: str,
     fold: int | None = None,
+    member_folds: list[int] | None = None,
 ) -> list[dict]:
     """Train a whole group of members together, vectorized, on one GPU.
 
     With ``fold`` set (k-fold mode) every member of the group belongs to that
-    fold and gets its own without-replacement train/val rows.
+    fold and gets its own without-replacement train/val rows. With
+    ``member_folds`` (``kfold_stack_folds``) member ``i`` belongs to fold
+    ``member_folds[i]``, so one group can hold members of several folds.
     """
     import os
 
@@ -323,12 +330,21 @@ def _train_group_worker(
         config=vconf, output_dir=output_dir, run_name=run_name, device=device
     )
     train_matrix = val_matrix = None
-    if fold is not None:
+    if fold is not None and member_folds is None:
+        member_folds = [fold] * len(seeds)
+    if member_folds is not None:
+        if len(member_folds) != len(seeds):
+            raise ValueError(f"{len(member_folds)} member folds for {len(seeds)} members")
         folds = _load_folds(snapshot_path)
         step = econf.kfold_step()
-        member_splits = [step.member_indices(dataset, folds, fold, s) for s in seeds]
-        train_matrix = np.stack([m.train for m in member_splits])
-        val_matrix = np.stack([m.val for m in member_splits])
+        member_splits = [
+            step.member_indices(dataset, folds, f, s) for f, s in zip(member_folds, seeds)
+        ]
+        # Folds differ in size by a few events, so members of different folds
+        # have rows of different length: pad with -1 (a zero-weight row that
+        # the vectorized trainer masks out). Within one fold nothing is padded.
+        train_matrix = _pad_rows([m.train for m in member_splits])
+        val_matrix = _pad_rows([m.val for m in member_splits])
         splits = member_splits[0]
     summaries = trainer.train(
         dataset,
@@ -342,10 +358,19 @@ def _train_group_worker(
         train_matrix=train_matrix,
         val_matrix=val_matrix,
     )
-    if fold is not None:
-        for s in summaries:
-            s["fold"] = int(fold)
+    if member_folds is not None:
+        for s, f in zip(summaries, member_folds):
+            s["fold"] = int(f)
     return summaries
+
+
+def _pad_rows(rows: list[np.ndarray]) -> np.ndarray:
+    """Stack index arrays of unequal length into ``(M, max_len)``, padded with -1."""
+    width = max(len(r) for r in rows)
+    out = np.full((len(rows), width), -1, dtype=np.int64)
+    for i, r in enumerate(rows):
+        out[i, : len(r)] = r
+    return out
 
 
 def _run_jobs_sequentially(jobs: list[dict], common: dict) -> list[dict]:
@@ -522,6 +547,8 @@ class CARLEnsemble:
         its folds one after another, so at most one group per GPU is resident.
         """
         cfg = self.config
+        if cfg.kfold_stack_folds:
+            return self._train_kfold_stacked(member_ids, gpus, common)
         size = cfg.members_per_group or len(member_ids)
         jobs = []
         for fold in range(cfg.k_folds):
@@ -536,6 +563,45 @@ class CARLEnsemble:
             per_gpu[slot].append({**job, "gpu_id": gpus[slot]})
 
         work = [js for js in per_gpu.values() if js]
+        if len(work) <= 1:
+            return _run_jobs_sequentially(work[0], common) if work else []
+        ctx = torch.multiprocessing.get_context("spawn")
+        with ProcessPoolExecutor(max_workers=len(work), mp_context=ctx) as pool:
+            futures = [pool.submit(_run_jobs_sequentially, js, common) for js in work]
+            out: list[dict] = []
+            for fut in futures:
+                out.extend(fut.result())
+        return out
+
+    def _train_kfold_stacked(self, member_ids: list[int], gpus: list, common: dict) -> list[dict]:
+        """All k folds at once: members of every fold share the stacked groups.
+
+        The (fold, member) pairs are dealt round-robin to the GPUs, like the
+        bootstrap members in ``_groups``; each GPU trains its share as one
+        group (or several, of at most ``members_per_group``), one after
+        another. Every member keeps the id, seed and rows it would get from
+        the fold-by-fold path; only which members share a group changes.
+        """
+        cfg = self.config
+        pairs = [(self.fold_member_id(f, m), f) for f in range(cfg.k_folds) for m in member_ids]
+        slots = gpus if gpus else [None]
+        per_gpu: list[list[tuple[int, int]]] = [[] for _ in slots]
+        for i, pair in enumerate(pairs):
+            per_gpu[i % len(slots)].append(pair)
+
+        work = []
+        for gpu, share in zip(slots, per_gpu):
+            if not share:
+                continue
+            size = cfg.members_per_group or len(share)
+            jobs = []
+            for s in range(0, len(share), size):
+                chunk = share[s : s + size]
+                jobs.append(dict(member_ids=[g for g, _ in chunk],
+                                 seeds=[cfg.start_seed + g for g, _ in chunk],
+                                 member_folds=[f for _, f in chunk], gpu_id=gpu))
+            work.append(jobs)
+
         if len(work) <= 1:
             return _run_jobs_sequentially(work[0], common) if work else []
         ctx = torch.multiprocessing.get_context("spawn")

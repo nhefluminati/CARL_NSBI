@@ -141,6 +141,7 @@ class Pipeline:
                     start_member=ens_cfg.get("start_member", 0),
                     mode=ens_cfg.get("mode", "vectorized"),
                     members_per_group=ens_cfg.get("members_per_group", 0),
+                    kfold_stack_folds=bool(ens_cfg.get("kfold_stack_folds", False)),
                     combiner=validate_combiner(
                         ens_cfg.get("combiner", DEFAULT_COMBINER),
                         ens_cfg.get("combiner_trim", 0.1),

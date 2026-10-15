@@ -266,6 +266,13 @@ class VectorizedEnsembleTrainer:
             boot = _member_bootstrap_matrix(
                 splits, labels, seeds, bootstrap_fraction, bootstrap, bootstrap_reference
             )
+        # Rows of -1 are padding (members of different k-folds have pools of
+        # slightly different size). They point at event 0 and carry weight 0.
+        train_valid = boot >= 0
+        train_pad = not bool(train_valid.all())
+        if train_pad:
+            boot = np.where(train_valid, boot, 0)
+            train_mask_t = torch.as_tensor(train_valid, dtype=torch.float32, device=dev)
         boot_t = torch.as_tensor(boot, dtype=torch.long, device=dev)
         n_train = boot_t.shape[1]
 
@@ -283,6 +290,11 @@ class VectorizedEnsembleTrainer:
             val_np = np.asarray(val_matrix, dtype=np.int64)
             if val_np.shape[0] != M:
                 raise ValueError(f"val_matrix has {val_np.shape[0]} rows for {M} members")
+            val_valid = val_np >= 0
+            val_pad = not bool(val_valid.all())
+            if val_pad:
+                val_np = np.where(val_valid, val_np, 0)
+                val_mask_t = torch.as_tensor(val_valid, dtype=torch.float32, device=dev)
             val_t = torch.as_tensor(val_np, dtype=torch.long, device=dev)
         else:
             val_idx = torch.as_tensor(np.array(splits.val, dtype=np.int64), device=dev)
@@ -297,14 +309,14 @@ class VectorizedEnsembleTrainer:
         w_np_all = dataset.w.numpy().reshape(-1)
         y_np_all = dataset.y.numpy().reshape(-1)
         tgt_scale = torch.tensor(
-            [rebalance_scale(w_np_all, y_np_all, boot[m]) for m in range(M)],
+            [rebalance_scale(w_np_all, y_np_all, boot[m][train_valid[m]]) for m in range(M)],
             dtype=torch.float32, device=dev,
         )
         # The same balance on each member's own validation rows, so the
         # early-stopping loss is the loss of a balanced problem too.
         val_scale = (
             torch.tensor(
-                [rebalance_scale(w_np_all, y_np_all, val_np[m]) for m in range(M)],
+                [rebalance_scale(w_np_all, y_np_all, val_np[m][val_valid[m]]) for m in range(M)],
                 dtype=torch.float32, device=dev,
             )
             if per_member_val else None
@@ -321,7 +333,7 @@ class VectorizedEnsembleTrainer:
             # Member 0's actual training rows (bootstrap applied), so this
             # describes the tensor the network really sees rather than the
             # dataset before resampling.
-            rows = boot[0]
+            rows = boot[0][train_valid[0]]
             w_rows = w_np_all[rows].copy()
             # Report the weights as the network sees them, i.e. after the
             # member's rebalance factor.
@@ -330,7 +342,7 @@ class VectorizedEnsembleTrainer:
                 w_rows, y_np_all[rows],
                 tag=f"{self.run_name} member_{member_ids[0]:03d}", split="train",
             )
-            v_rows = val_np[0] if per_member_val else splits.val
+            v_rows = val_np[0][val_valid[0]] if per_member_val else splits.val
             log_weight_summary(
                 w_np_all[v_rows], y_np_all[v_rows], tag=self.run_name, split="val  ",
                 strict_balance=False,
@@ -376,6 +388,8 @@ class VectorizedEnsembleTrainer:
                 wb = w_all[idx] * torch.where(
                     yb > 0.5, tgt_scale[:, None], torch.ones_like(tgt_scale)[:, None]
                 )
+                if train_pad:
+                    wb = wb * torch.gather(train_mask_t, 1, sel)
 
                 with self._autocast():
                     logits = forward(xb)                         # (M, B)
@@ -413,6 +427,8 @@ class VectorizedEnsembleTrainer:
                         wv = w_all[idx] * torch.where(
                             yv > 0.5, val_scale[:, None], torch.ones_like(val_scale)[:, None]
                         )
+                        if val_pad:
+                            wv = wv * val_mask_t[:, s : s + cfg.val_batch_size]
                         with self._autocast():
                             logits = forward(x_all[idx])                  # (M, B)
                         bce = F.binary_cross_entropy_with_logits(
