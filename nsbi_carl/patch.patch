@@ -1,0 +1,781 @@
+From 603d0f81b52228d20deb94419b854e5532e46e07 Mon Sep 17 00:00:00 2001
+From: Luca Spitzauer <LucaSpitzauerTUM@gmail.com>
+Date: Mon, 19 Oct 2026 10:27:20 +0200
+Subject: [PATCH] Add transformer CARL architecture selectable via
+ model.architecture
+
+model.architecture: dnn (default) | transformer. The transformer is a small
+feature-tokenising encoder (one token per feature + [CLS]); hyperparameters
+under model.transformer. Works for single-network, process-pool, vectorized
+(torch.func.vmap) and k-fold ensembles and for EnsembleScorer inference.
+Checkpoints store the architecture; older checkpoints load as dnn.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+Claude-Session: https://claude.ai/code/session_014JsPRaMZu2KN4k9SEcqyQ8
+---
+ README.md                        |  11 +++
+ configs/example.yaml             |  12 ++-
+ nsbi_carl/inference.py           |  23 +----
+ nsbi_carl/model.py               | 165 ++++++++++++++++++++++++++++++-
+ nsbi_carl/pipeline.py            |   8 +-
+ nsbi_carl/training/ensemble.py   |  31 ++----
+ nsbi_carl/training/trainer.py    |  16 ++-
+ nsbi_carl/training/vectorized.py | 147 ++++++++++++++++++++++++++-
+ tests/transformer_test.py        | 160 ++++++++++++++++++++++++++++++
+ 9 files changed, 518 insertions(+), 55 deletions(-)
+ create mode 100644 tests/transformer_test.py
+
+diff --git a/README.md b/README.md
+index ad24608..10dfa9f 100644
+--- a/README.md
++++ b/README.md
+@@ -106,6 +106,17 @@ swish (SiLU) hidden activations, single sigmoid output, weighted BCE loss,
+ SGD optimizer, `CosineAnnealingWarmRestarts(T_0, T_mult, eta_min)` scheduler.
+ Train/val loss are logged each epoch.
+ 
++`model.architecture` switches the network: `dnn` (default, the feed-forward
++network above) or `transformer`, a small feature-tokenising transformer
++(`FeatureTransformer`): each input feature becomes one token
++(`x_f * W_f + b_f`), a learned [CLS] token is prepended, `model.transformer.n_layers`
++pre-norm encoder blocks (`d_model`, `n_heads`, `ff_dim`) run over the tokens
++and the [CLS] state is mapped to the logit. Loss, optimizer, scheduler,
++ensembles (both `vectorized` and `process` mode), k-fold and inference work
++unchanged; in vectorized mode the members are batched with `torch.func.vmap`.
++The architecture is stored in each checkpoint's hyperparameters, so older
++checkpoints load as `dnn`.
++
+ ## Metrics & plots
+ 
+ Metrics implement `.evaluate(ctx)`, plots implement `.plot(ctx)`. They are
+diff --git a/configs/example.yaml b/configs/example.yaml
+index 54f52bb..d86acd0 100644
+--- a/configs/example.yaml
++++ b/configs/example.yaml
+@@ -26,9 +26,15 @@ split:
+                                   # test set no member trains or validates on
+ 
+ model:
+-  n_layers: 5
+-  n_nodes: 256
+-  dropout: 0.0
++  architecture: dnn               # dnn | transformer
++  n_layers: 5                     # dnn only
++  n_nodes: 256                    # dnn only
++  dropout: 0.0                    # both architectures
++  transformer:                    # architecture: transformer only
++    d_model: 32                   # token embedding width (one token per feature + [CLS])
++    n_heads: 4                    # attention heads; must divide d_model
++    n_layers: 3                   # encoder blocks
++    ff_dim: 64                    # feed-forward width inside each block
+   scheduler:                      # CosineAnnealingWarmRestarts
+     t0: 25                        # restart period (epochs)
+     t_mult: 1                     # period multiplication factor after each restart
+diff --git a/nsbi_carl/inference.py b/nsbi_carl/inference.py
+index a938883..050ef71 100644
+--- a/nsbi_carl/inference.py
++++ b/nsbi_carl/inference.py
+@@ -274,26 +274,9 @@ class EnsembleScorer:
+         return len(self.models)
+ 
+     def _build_stacked(self, member_idx: list[int]):
+-        from .training.vectorized import StackedMLP
+-
+-        models = [self.models[i] for i in member_idx]
+-        hp = models[0].hparams
+-        model = StackedMLP(
+-            n_members=len(models),
+-            n_features=hp["n_features"],
+-            n_layers=hp["n_layers"],
+-            n_nodes=hp["n_nodes"],
+-            dropout=hp.get("dropout", 0.0),
+-        )
+-        stride = 3 if hp.get("dropout", 0.0) > 0.0 else 2
+-        with torch.no_grad():
+-            for m, member in enumerate(models):
+-                sd = member.state_dict()
+-                for layer in range(len(model.weights)):
+-                    idx = layer * stride
+-                    model.weights[layer][m].copy_(sd[f"net.{idx}.weight"].t())
+-                    model.biases[layer][m, 0].copy_(sd[f"net.{idx}.bias"])
+-        return model.to(self.device).eval()
++        from .training.vectorized import stack_trained_members
++
++        return stack_trained_members([self.models[i] for i in member_idx], self.device)
+ 
+     def scale(self, x_raw: np.ndarray) -> np.ndarray:
+         x = np.asarray(x_raw, dtype=np.float64)
+diff --git a/nsbi_carl/model.py b/nsbi_carl/model.py
+index 3b383ed..4c98cb3 100644
+--- a/nsbi_carl/model.py
++++ b/nsbi_carl/model.py
+@@ -1,8 +1,15 @@
+ """The CARL classifier as a LightningModule.
+ 
+-Architecture: configurable feed-forward network, swish (SiLU) activations in
+-the hidden layers, single sigmoid output. Trained with a weighted binary
+-cross entropy and a CosineAnnealingWarmRestarts schedule.
++Architecture: selected by ``architecture``:
++
++* ``"dnn"`` (default): configurable feed-forward network, swish (SiLU)
++  activations in the hidden layers.
++* ``"transformer"``: a small feature-tokenising transformer
++  (:class:`FeatureTransformer`): every input feature becomes one token, a
++  learned [CLS] token attends over them, and the [CLS] state is read out.
++
++Both end in a single logit (sigmoid in ``forward``) and are trained with a
++weighted binary cross entropy and a CosineAnnealingWarmRestarts schedule.
+ 
+ Auxiliary diagnostics: an :class:`~nsbi_carl.evaluation.base.EvaluationSuite`
+ can be attached (``model.evaluation = suite``). At the end of every
+@@ -70,6 +77,141 @@ def build_mlp(n_features: int, n_layers: int, n_nodes: int, dropout: float) -> n
+     return nn.Sequential(*layers)
+ 
+ 
++# ---------------------------------------------------------------------------
++# Transformer variant
++# ---------------------------------------------------------------------------
++ARCHITECTURES = ("dnn", "transformer")
++
++
++def validate_architecture(name: str) -> str:
++    key = str(name).lower()
++    if key in ("mlp", "ffnn", "fcnn"):
++        key = "dnn"
++    if key not in ARCHITECTURES:
++        raise ValueError(f"Unknown model architecture {name!r}; use one of {ARCHITECTURES}.")
++    return key
++
++
++class TransformerBlock(nn.Module):
++    """Pre-norm encoder block: self-attention + SiLU feed-forward.
++
++    Attention is written out explicitly (no ``nn.MultiheadAttention``) so the
++    block has no fused "fast path" and runs unchanged under ``torch.func.vmap``,
++    which is how the vectorized ensemble trainer batches the members.
++    """
++
++    def __init__(self, d_model: int, n_heads: int, ff_dim: int, dropout: float = 0.0):
++        super().__init__()
++        if d_model % n_heads:
++            raise ValueError(f"d_model ({d_model}) must be divisible by n_heads ({n_heads})")
++        self.n_heads = int(n_heads)
++        self.head_dim = d_model // n_heads
++        self.dropout = float(dropout)
++        self.norm1 = nn.LayerNorm(d_model)
++        self.qkv = nn.Linear(d_model, 3 * d_model)
++        self.proj = nn.Linear(d_model, d_model)
++        self.norm2 = nn.LayerNorm(d_model)
++        self.ff1 = nn.Linear(d_model, ff_dim)
++        self.ff2 = nn.Linear(ff_dim, d_model)
++
++    def _drop(self, t: torch.Tensor) -> torch.Tensor:
++        return F.dropout(t, p=self.dropout, training=self.training) if self.dropout > 0.0 else t
++
++    def forward(self, h: torch.Tensor) -> torch.Tensor:
++        B, T, D = h.shape
++        q, k, v = self.qkv(self.norm1(h)).chunk(3, dim=-1)
++        q, k, v = (t.reshape(B, T, self.n_heads, self.head_dim).transpose(1, 2) for t in (q, k, v))
++        att = torch.softmax((q @ k.transpose(-2, -1)) * self.head_dim ** -0.5, dim=-1)
++        a = (self._drop(att) @ v).transpose(1, 2).reshape(B, T, D)
++        h = h + self._drop(self.proj(a))
++        h = h + self._drop(self.ff2(self._drop(F.silu(self.ff1(self.norm2(h))))))
++        return h
++
++
++class FeatureTransformer(nn.Module):
++    """Simple transformer for tabular inputs (FT-Transformer style).
++
++    ``x`` ``(B, F)`` -> tokens ``(B, F, d)`` via a per-feature affine embedding
++    ``x_f * W_f + b_f``, a learned [CLS] token is prepended, ``n_layers``
++    encoder blocks run over the ``F + 1`` tokens and the final [CLS] state is
++    mapped to one logit. Returns ``(B, 1)``, the same shape as ``build_mlp``.
++
++    The logit head is a broadcast multiply + sum rather than ``nn.Linear(d, 1)``
++    for the same reason as ``StackedMLP``'s head: a batched matmul with inner
++    dimension 1 in the backward is routed to a runtime-compiled Triton kernel.
++    """
++
++    def __init__(
++        self,
++        n_features: int,
++        d_model: int = 32,
++        n_heads: int = 4,
++        n_layers: int = 3,
++        ff_dim: int = 64,
++        dropout: float = 0.0,
++    ):
++        super().__init__()
++        self.n_features = int(n_features)
++        self.d_model = int(d_model)
++        bound = d_model ** -0.5
++        self.tok_weight = nn.Parameter(torch.empty(n_features, d_model).uniform_(-bound, bound))
++        self.tok_bias = nn.Parameter(torch.empty(n_features, d_model).uniform_(-bound, bound))
++        self.cls = nn.Parameter(torch.empty(d_model).uniform_(-bound, bound))
++        self.blocks = nn.ModuleList(
++            [TransformerBlock(d_model, n_heads, ff_dim, dropout) for _ in range(n_layers)]
++        )
++        self.norm = nn.LayerNorm(d_model)
++        self.head_weight = nn.Parameter(torch.empty(d_model).uniform_(-bound, bound))
++        self.head_bias = nn.Parameter(torch.zeros(1))
++
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        tokens = x.unsqueeze(-1) * self.tok_weight + self.tok_bias           # (B, F, d)
++        cls = self.cls.expand(x.shape[0], 1, self.d_model)                    # (B, 1, d)
++        h = torch.cat([cls, tokens], dim=1)                                   # (B, F+1, d)
++        for block in self.blocks:
++            h = block(h)
++        z = self.norm(h[:, 0])                                                # (B, d)
++        return (z * self.head_weight).sum(-1, keepdim=True) + self.head_bias  # (B, 1)
++
++
++def build_network(
++    n_features: int,
++    architecture: str = "dnn",
++    n_layers: int = 5,
++    n_nodes: int = 128,
++    dropout: float = 0.0,
++    tf_d_model: int = 32,
++    tf_n_heads: int = 4,
++    tf_n_layers: int = 3,
++    tf_ff_dim: int = 64,
++) -> nn.Module:
++    """The network behind ``CARL.net`` for either architecture."""
++    if validate_architecture(architecture) == "transformer":
++        return FeatureTransformer(
++            n_features, d_model=tf_d_model, n_heads=tf_n_heads,
++            n_layers=tf_n_layers, ff_dim=tf_ff_dim, dropout=dropout,
++        )
++    return build_mlp(n_features, n_layers, n_nodes, dropout)
++
++
++def architecture_hparams(hp) -> dict:
++    """The network-defining hyperparameters of a CARL ``hparams`` mapping.
++
++    Checkpoints written before the transformer option existed carry no
++    ``architecture`` key; they are DNNs.
++    """
++    return dict(
++        architecture=validate_architecture(hp.get("architecture", "dnn")),
++        n_layers=hp.get("n_layers", 5),
++        n_nodes=hp.get("n_nodes", 128),
++        dropout=hp.get("dropout", 0.0),
++        tf_d_model=hp.get("tf_d_model", 32),
++        tf_n_heads=hp.get("tf_n_heads", 4),
++        tf_n_layers=hp.get("tf_n_layers", 3),
++        tf_ff_dim=hp.get("tf_ff_dim", 64),
++    )
++
++
+ class CARL(L.LightningModule):
+     def __init__(
+         self,
+@@ -84,11 +226,26 @@ class CARL(L.LightningModule):
+         scheduler_eta_min: float = 1e-8,
+         optimizer: str = "sgd",
+         weight_decay: float = 0.0,
++        architecture: str = "dnn",
++        tf_d_model: int = 32,
++        tf_n_heads: int = 4,
++        tf_n_layers: int = 3,
++        tf_ff_dim: int = 64,
+     ):
+         super().__init__()
+         self.save_hyperparameters()
+ 
+-        self.net = build_mlp(n_features, n_layers, n_nodes, dropout)
++        self.net = build_network(
++            n_features,
++            architecture=architecture,
++            n_layers=n_layers,
++            n_nodes=n_nodes,
++            dropout=dropout,
++            tf_d_model=tf_d_model,
++            tf_n_heads=tf_n_heads,
++            tf_n_layers=tf_n_layers,
++            tf_ff_dim=tf_ff_dim,
++        )
+ 
+         # Attached by the trainer; not a hyperparameter.
+         self.evaluation: EvaluationSuite = EvaluationSuite()
+diff --git a/nsbi_carl/pipeline.py b/nsbi_carl/pipeline.py
+index 258e2ba..5c51652 100644
+--- a/nsbi_carl/pipeline.py
++++ b/nsbi_carl/pipeline.py
+@@ -34,7 +34,7 @@ from .evaluation import base as _eval_base
+ from .evaluation import metrics as _metrics  # noqa: F401  (populate registries)
+ from .evaluation import plots as _plots      # noqa: F401
+ from .training.ensemble import CARLEnsemble, EnsembleConfig
+-from .model import validate_optimizer
++from .model import validate_architecture, validate_optimizer
+ from .training.trainer import CARLTrainer, ModelConfig, TrainerConfig
+ 
+ 
+@@ -87,17 +87,23 @@ class Pipeline:
+ 
+         model_cfg = config.get("model", {})
+         sched_cfg = model_cfg.get("scheduler", {})
++        tf_cfg = model_cfg.get("transformer", {}) or {}
+         train_cfg = config.get("training", {})
+         perf_cfg = config.get("performance", {})
+         eval_cfg = config.get("evaluation", {})
+         self.trainer = CARLTrainer(
+             model_config=ModelConfig(
++                architecture=validate_architecture(model_cfg.get("architecture", "dnn")),
+                 n_layers=model_cfg.get("n_layers", 5),
+                 n_nodes=model_cfg.get("n_nodes", 128),
+                 dropout=model_cfg.get("dropout", 0.0),
+                 scheduler_t0=sched_cfg.get("t0", 25),
+                 scheduler_t_mult=sched_cfg.get("t_mult", 1),
+                 scheduler_eta_min=sched_cfg.get("eta_min", 1e-8),
++                tf_d_model=tf_cfg.get("d_model", 32),
++                tf_n_heads=tf_cfg.get("n_heads", 4),
++                tf_n_layers=tf_cfg.get("n_layers", 3),
++                tf_ff_dim=tf_cfg.get("ff_dim", 64),
+             ),
+             trainer_config=TrainerConfig(
+                 batch_size=train_cfg.get("batch_size", 512),
+diff --git a/nsbi_carl/training/ensemble.py b/nsbi_carl/training/ensemble.py
+index 2626e29..8ddf30b 100644
+--- a/nsbi_carl/training/ensemble.py
++++ b/nsbi_carl/training/ensemble.py
+@@ -732,12 +732,12 @@ class CARLEnsemble:
+             return 65536
+         torch.cuda.empty_cache()
+         free, _ = torch.cuda.mem_get_info(dev)
+-        width = max(model.n_nodes, model.n_features)
++        width = getattr(model, "activation_width", max(model.n_nodes, model.n_features))
+         per_event = 3 * model.n_members * width * 4  # ~3 live fp32 (M, B, H) tensors per layer
+         return int(max(1024, min(262144, mem_fraction * free // per_event)))
+ 
+     def stacked(self, device: str | torch.device = "cpu"):
+-        """Fuse the loaded members into one :class:`StackedMLP` for inference."""
++        """Fuse the loaded members into one stacked module for inference."""
+         if self._stacked is not None and self._stacked_device == str(device):
+             return self._stacked
+         if not self.models:
+@@ -881,23 +881,10 @@ class CARLEnsemble:
+ 
+ 
+ def stack_members(models: list, device: str | torch.device = "cpu"):
+-    """Fuse CARL members into one :class:`StackedMLP` (one pass for all)."""
+-    from .vectorized import StackedMLP
+-
+-    hp = models[0].hparams
+-    model = StackedMLP(
+-        n_members=len(models),
+-        n_features=hp["n_features"],
+-        n_layers=hp["n_layers"],
+-        n_nodes=hp["n_nodes"],
+-        dropout=hp.get("dropout", 0.0),
+-    )
+-    stride = 3 if hp.get("dropout", 0.0) > 0.0 else 2
+-    with torch.no_grad():
+-        for m, member in enumerate(models):
+-            sd = member.state_dict()
+-            for layer in range(len(model.weights)):
+-                idx = layer * stride
+-                model.weights[layer][m].copy_(sd[f"net.{idx}.weight"].t())
+-                model.biases[layer][m, 0].copy_(sd[f"net.{idx}.bias"])
+-    return model.to(device).eval()
++    """Fuse CARL members into one stacked module (one pass for all).
++
++    ``StackedMLP`` for DNN members, ``StackedTransformer`` for transformers.
++    """
++    from .vectorized import stack_trained_members
++
++    return stack_trained_members(models, device)
+diff --git a/nsbi_carl/training/trainer.py b/nsbi_carl/training/trainer.py
+index 3a926a8..5fef375 100644
+--- a/nsbi_carl/training/trainer.py
++++ b/nsbi_carl/training/trainer.py
+@@ -59,9 +59,14 @@ class TrainerConfig:
+ 
+ @dataclass
+ class ModelConfig:
+-    n_layers: int = 5
+-    n_nodes: int = 128
+-    dropout: float = 0.0
++    architecture: str = "dnn"       # "dnn" | "transformer"
++    n_layers: int = 5               # dnn only
++    n_nodes: int = 128              # dnn only
++    dropout: float = 0.0            # both architectures
++    tf_d_model: int = 32            # transformer only: token embedding width
++    tf_n_heads: int = 4             # transformer only: attention heads (divides tf_d_model)
++    tf_n_layers: int = 3            # transformer only: encoder blocks
++    tf_ff_dim: int = 64             # transformer only: feed-forward width per block
+     scheduler_t0: int = 25
+     scheduler_t_mult: int = 1
+     scheduler_eta_min: float = 1e-8
+@@ -113,6 +118,11 @@ class CARLTrainer:
+             scheduler_eta_min=mc.scheduler_eta_min,
+             optimizer=self.config.optimizer,
+             weight_decay=self.config.weight_decay,
++            architecture=mc.architecture,
++            tf_d_model=mc.tf_d_model,
++            tf_n_heads=mc.tf_n_heads,
++            tf_n_layers=mc.tf_n_layers,
++            tf_ff_dim=mc.tf_ff_dim,
+         )
+ 
+     def make_loaders(
+diff --git a/nsbi_carl/training/vectorized.py b/nsbi_carl/training/vectorized.py
+index f0d93a9..3a4dfa7 100644
+--- a/nsbi_carl/training/vectorized.py
++++ b/nsbi_carl/training/vectorized.py
+@@ -31,6 +31,7 @@ bootstrap resample drawn by the same seeded generators.
+ 
+ from __future__ import annotations
+ 
++import copy
+ import json
+ from dataclasses import dataclass
+ from pathlib import Path
+@@ -44,7 +45,7 @@ import lightning as L
+ 
+ from ..data.dataset import NSBIDataset, SplitIndices
+ from ..data.reweighting import log_weight_summary
+-from ..model import build_mlp
++from ..model import FeatureTransformer, architecture_hparams, build_mlp
+ 
+ 
+ # ---------------------------------------------------------------------------
+@@ -134,6 +135,138 @@ class StackedMLP(nn.Module):
+         return state
+ 
+ 
++# ---------------------------------------------------------------------------
++class StackedTransformer(nn.Module):
++    """``n_members`` independent :class:`FeatureTransformer` s in one pass.
++
++    Every parameter of the reference network is stored once with a leading
++    member axis, and the forward is ``torch.func.vmap`` over that axis of a
++    ``functional_call`` into a parameter-less template. Like ``StackedMLP``
++    the members are mathematically independent (disjoint parameter slices),
++    member ``m`` initialises exactly as a standalone ``CARL`` built under
++    ``seed[m]`` would, and ``member_state_dict`` returns ``CARL.net`` naming.
++    """
++
++    def __init__(
++        self,
++        n_members: int,
++        n_features: int,
++        d_model: int = 32,
++        n_heads: int = 4,
++        n_layers: int = 3,
++        ff_dim: int = 64,
++        dropout: float = 0.0,
++    ):
++        super().__init__()
++        self.n_members = int(n_members)
++        self.n_features = int(n_features)
++        self.arch = dict(d_model=int(d_model), n_heads=int(n_heads), n_layers=int(n_layers),
++                         ff_dim=int(ff_dim), dropout=float(dropout))
++        ref = self._reference()
++        self._names = [name for name, _ in ref.named_parameters()]
++        self.params = nn.ParameterDict({
++            self._key(name): nn.Parameter(p.detach().unsqueeze(0).repeat(
++                self.n_members, *([1] * p.ndim)).clone())
++            for name, p in ref.named_parameters()
++        })
++        # Parameter-less template the functional call runs through. Kept in a
++        # tuple so it is not registered as a submodule (no duplicate params).
++        self._template = (copy.deepcopy(ref).to("meta"),)
++
++        # Per-event activation footprint, for batch sizing (see
++        # CARLEnsemble._auto_batch_size): tokens x widest layer + attention.
++        T = self.n_features + 1
++        self.activation_width = T * max(3 * d_model, ff_dim) + n_heads * T * T
++        self.n_nodes = self.activation_width  # legacy attribute read by batch sizing
++
++    def _reference(self) -> FeatureTransformer:
++        return FeatureTransformer(self.n_features, **self.arch)
++
++    @staticmethod
++    def _key(name: str) -> str:
++        return name.replace(".", "__")  # ParameterDict keys may not contain "."
++
++    def train(self, mode: bool = True):
++        super().train(mode)
++        self._template[0].train(mode)  # dropout follows the stacked module
++        return self
++
++    # -- initialisation -----------------------------------------------------
++    def init_from_seeds(self, seeds: list[int]) -> None:
++        if len(seeds) != self.n_members:
++            raise ValueError(f"expected {self.n_members} seeds, got {len(seeds)}")
++        with torch.no_grad():
++            for m, seed in enumerate(seeds):
++                torch.manual_seed(int(seed))
++                ref = self._reference()
++                for name, p in ref.named_parameters():
++                    self.params[self._key(name)][m].copy_(p)
++
++    def load_member_state(self, m: int, state: dict[str, torch.Tensor], prefix: str = "net.") -> None:
++        with torch.no_grad():
++            for name in self._names:
++                self.params[self._key(name)][m].copy_(state[prefix + name])
++
++    # -- forward ------------------------------------------------------------
++    def forward(self, x: torch.Tensor) -> torch.Tensor:
++        """``x`` ``(M, B, F)`` or shared ``(B, F)`` -> logits ``(M, B)``."""
++        template = self._template[0]
++        params = {name: self.params[self._key(name)] for name in self._names}
++
++        def one(p, xx):
++            return torch.func.functional_call(template, p, (xx,)).squeeze(-1)
++
++        x_dim = 0 if x.dim() == 3 else None
++        return torch.func.vmap(one, in_dims=(0, x_dim), randomness="different")(params, x)
++
++    # -- export -------------------------------------------------------------
++    def member_state_dict(self, m: int) -> dict[str, torch.Tensor]:
++        return {
++            f"net.{name}": self.params[self._key(name)][m].detach().cpu().clone()
++            for name in self._names
++        }
++
++
++def build_stacked(n_members: int, n_features: int, model_config=None, hp: dict | None = None) -> nn.Module:
++    """Stacked module for the configured architecture.
++
++    Pass either a ``ModelConfig`` (training) or a CARL ``hparams`` mapping
++    (re-stacking trained members for inference).
++    """
++    if hp is None:
++        hp = {k: getattr(model_config, k) for k in (
++            "architecture", "n_layers", "n_nodes", "dropout",
++            "tf_d_model", "tf_n_heads", "tf_n_layers", "tf_ff_dim",
++        ) if hasattr(model_config, k)}
++    a = architecture_hparams(hp)
++    if a["architecture"] == "transformer":
++        return StackedTransformer(
++            n_members, n_features, d_model=a["tf_d_model"], n_heads=a["tf_n_heads"],
++            n_layers=a["tf_n_layers"], ff_dim=a["tf_ff_dim"], dropout=a["dropout"],
++        )
++    return StackedMLP(n_members, n_features, a["n_layers"], a["n_nodes"], a["dropout"])
++
++
++def stack_trained_members(models: list, device: str | torch.device = "cpu") -> nn.Module:
++    """Fuse trained CARL members (either architecture) into one stacked module."""
++    hp = models[0].hparams
++    a = architecture_hparams(hp)
++    model = build_stacked(len(models), hp["n_features"], hp=hp)
++    with torch.no_grad():
++        if a["architecture"] == "transformer":
++            for m, member in enumerate(models):
++                model.load_member_state(m, member.state_dict())
++        else:
++            stride = 3 if a["dropout"] > 0.0 else 2
++            for m, member in enumerate(models):
++                sd = member.state_dict()
++                for layer in range(len(model.weights)):
++                    idx = layer * stride
++                    model.weights[layer][m].copy_(sd[f"net.{idx}.weight"].t())
++                    model.biases[layer][m, 0].copy_(sd[f"net.{idx}.bias"])
++    return model.to(device).eval()
++
++
+ # ---------------------------------------------------------------------------
+ @dataclass
+ class VectorizedConfig:
+@@ -256,6 +389,11 @@ class VectorizedEnsembleTrainer:
+         n_layers = getattr(model_config, "n_layers", 5)
+         n_nodes = getattr(model_config, "n_nodes", 128)
+         dropout = getattr(model_config, "dropout", 0.0)
++        arch_hp = architecture_hparams(
++            {k: getattr(model_config, k) for k in (
++                "architecture", "tf_d_model", "tf_n_heads", "tf_n_layers", "tf_ff_dim",
++            ) if hasattr(model_config, k)}
++        )
+ 
+         labels = dataset.y.numpy().reshape(-1)
+         if train_matrix is not None:
+@@ -348,7 +486,7 @@ class VectorizedEnsembleTrainer:
+                 strict_balance=False,
+             )
+ 
+-        model = StackedMLP(M, dataset.n_features, n_layers, n_nodes, dropout).to(dev)
++        model = build_stacked(M, dataset.n_features, model_config).to(dev)
+         model.init_from_seeds(seeds)
+         forward = model
+         if cfg.compile:
+@@ -497,6 +635,11 @@ class VectorizedEnsembleTrainer:
+                         "scheduler_eta_min": cfg.scheduler_eta_min,
+                         "optimizer": cfg.optimizer,
+                         "weight_decay": cfg.weight_decay,
++                        "architecture": arch_hp["architecture"],
++                        "tf_d_model": arch_hp["tf_d_model"],
++                        "tf_n_heads": arch_hp["tf_n_heads"],
++                        "tf_n_layers": arch_hp["tf_n_layers"],
++                        "tf_ff_dim": arch_hp["tf_ff_dim"],
+                     },
+                     "pytorch-lightning_version": L.__version__,
+                     "epoch": len(val_hist),
+diff --git a/tests/transformer_test.py b/tests/transformer_test.py
+new file mode 100644
+index 0000000..69aa32b
+--- /dev/null
++++ b/tests/transformer_test.py
+@@ -0,0 +1,160 @@
++"""Transformer architecture: stacked/vmap path agrees with standalone CARL.
++
++Checks, on CPU with tiny shapes:
++  * a CARL built with architecture="transformer" runs forward/backward
++  * StackedTransformer.init_from_seeds reproduces the standalone init
++  * the stacked forward (per-member and shared input) matches each member
++  * per-member gradients are independent (disjoint parameter slices)
++  * member_state_dict loads back into CARL, and stack_trained_members
++    rebuilds an identical stack from those members
++  * no batched outer-product matmul is dispatched (see backward_test.py)
++  * old DNN hparams without an "architecture" key still build a DNN
++  * end to end through the Pipeline with model.architecture: transformer --
++    vectorized, process-pool, k-fold and single-network training, and the
++    EnsembleScorer used by the likelihood fit
++"""
++import shutil
++import sys
++import tempfile
++from pathlib import Path
++
++import numpy as np
++import torch
++
++sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
++
++from nsbi_carl.model import CARL, architecture_hparams  # noqa: E402
++from nsbi_carl.training.vectorized import (  # noqa: E402
++    StackedMLP,
++    StackedTransformer,
++    build_stacked,
++    stack_trained_members,
++)
++from backward_test import CatchOuterProductBmm  # noqa: E402
++
++TF = dict(tf_d_model=16, tf_n_heads=4, tf_n_layers=2, tf_ff_dim=32)
++
++
++def make_carl(n_features, seed):
++    torch.manual_seed(seed)
++    return CARL(n_features, architecture="transformer", **TF).eval()
++
++
++def main():
++    M, B, Fdim = 3, 50, 4
++    seeds = [7, 8, 9]
++
++    # -- standalone model ------------------------------------------------
++    carl = make_carl(Fdim, seeds[0])
++    x = torch.randn(B, Fdim)
++    out = carl.net(x)
++    assert out.shape == (B, 1), out.shape
++    out.sum().backward()
++    assert all(p.grad is not None for p in carl.parameters())
++
++    # -- stacked init == standalone init ---------------------------------
++    stacked = StackedTransformer(M, Fdim, d_model=16, n_heads=4, n_layers=2, ff_dim=32)
++    stacked.init_from_seeds(seeds)
++    members = [make_carl(Fdim, s) for s in seeds]
++    for m, member in enumerate(members):
++        sd = stacked.member_state_dict(m)
++        for k, v in member.state_dict().items():
++            torch.testing.assert_close(sd[k], v, msg=f"init mismatch {k}")
++
++    # -- forward agreement -------------------------------------------------
++    stacked.eval()
++    xm = torch.randn(M, B, Fdim)
++    with torch.no_grad():
++        per = stacked(xm)
++        shared = stacked(x)
++    assert per.shape == (M, B) and shared.shape == (M, B)
++    for m, member in enumerate(members):
++        with torch.no_grad():
++            torch.testing.assert_close(per[m], member.net(xm[m]).squeeze(-1), atol=1e-5, rtol=1e-5)
++            torch.testing.assert_close(shared[m], member.net(x).squeeze(-1), atol=1e-5, rtol=1e-5)
++
++    # -- member independence + no outer-product bmm -------------------------
++    stacked.train()
++    with CatchOuterProductBmm() as guard:
++        logits = stacked(xm)
++        logits[1].sum().backward()
++    assert not guard.offenders, guard.offenders
++    for name, p in stacked.params.items():
++        g = p.grad
++        assert g[0].abs().max() == 0 and g[2].abs().max() == 0, f"{name}: gradient leaked across members"
++
++    # -- export / re-stack round trip ---------------------------------------
++    restored = []
++    for m in range(M):
++        c = CARL(Fdim, architecture="transformer", **TF)
++        c.load_state_dict(stacked.member_state_dict(m))
++        restored.append(c.eval())
++    again = stack_trained_members(restored)
++    assert isinstance(again, StackedTransformer)
++    with torch.no_grad():
++        torch.testing.assert_close(again(xm), stacked.eval()(xm))
++
++    # -- backward compatibility ----------------------------------------------
++    old_hp = {"n_features": Fdim, "n_layers": 2, "n_nodes": 8, "dropout": 0.0}
++    assert architecture_hparams(old_hp)["architecture"] == "dnn"
++    assert isinstance(build_stacked(2, Fdim, hp=old_hp), StackedMLP)
++
++    pipeline_checks()
++    print("transformer_test: OK")
++
++
++def pipeline_checks():
++    from nsbi_carl import Pipeline
++    from nsbi_carl.inference import EnsembleScorer, read_record
++    from smoke_test import build_config
++
++    tf_model = {"architecture": "transformer",
++                "transformer": {"d_model": 16, "n_heads": 2, "n_layers": 1, "ff_dim": 32}}
++    tmp = Path(tempfile.mkdtemp(prefix="nsbi_tf_"))
++    try:
++        x = torch.randn(400, 2)
++        for mode in ("vectorized", "process"):
++            cfg = build_config(tmp, f"tf_{mode}")
++            cfg["ensemble"]["mode"] = mode
++            cfg["training"]["max_epochs"] = 2
++            cfg["model"] = tf_model
++            ens = Pipeline(cfg).run()["ensemble"]
++            assert len(ens.models) == 3
++            assert all(m.hparams["architecture"] == "transformer" for m in ens.models)
++            stacked = ens.member_predictions(x, device="cpu", stacked=True)
++            looped = ens.member_predictions(x, device="cpu", stacked=False)
++            dev = float(np.abs(stacked - looped).max())
++            assert dev < 1e-5, f"{mode}: stacked vs looped differ by {dev}"
++            print(f"[ok] transformer {mode} ensemble (stacked vs looped {dev:.1e})")
++
++            rec = read_record(tmp / f"out_tf_{mode}", f"smoke_tf_{mode}")
++            scorer = EnsembleScorer(rec, device="cpu")
++            xr = np.random.default_rng(0).normal(0, 1, (300, 2))
++            got = scorer.score(xr)
++            xs = torch.as_tensor(scorer.scale(xr), dtype=torch.float32)
++            with torch.no_grad():
++                want = np.mean([m(xs).flatten().numpy() for m in scorer.models], axis=0)
++            assert float(np.abs(got - want).max()) < 1e-5
++            print(f"[ok] transformer {mode}: EnsembleScorer matches per-member mean")
++
++        cfg = build_config(tmp, "tf_kfold")
++        cfg["split"]["k_folds"] = 2
++        cfg["ensemble"]["n_members"] = 2
++        cfg["training"]["max_epochs"] = 2
++        cfg["model"] = tf_model
++        ens = Pipeline(cfg).run()["ensemble"]
++        assert len(ens.models) == 4
++        print("[ok] transformer k-fold ensemble")
++
++        cfg = build_config(tmp, "tf_single", ensemble=False)
++        cfg["training"]["max_epochs"] = 2
++        cfg["model"] = tf_model
++        res = Pipeline(cfg).run()
++        assert res["summaries"][0]["val_loss"]
++        print("[ok] transformer single network")
++    finally:
++        shutil.rmtree(tmp, ignore_errors=True)
++
++
++if __name__ == "__main__":
++    main()
+-- 
+2.43.0

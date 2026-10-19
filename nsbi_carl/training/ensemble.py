@@ -27,9 +27,12 @@ can be evaluated on it.
 
 from __future__ import annotations
 
+import gc
 import json
+import math
 import zlib
-from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -399,6 +402,8 @@ class CARLEnsemble:
         self._stacked = None
         self._stacked_device: str | None = None
         self._fold_stacks: dict = {}
+        # (member indices, device) -> StackedMLP, kept only while it fits
+        self._stack_cache: dict = {}
 
     @property
     def manifest_path(self) -> Path:
@@ -680,9 +685,122 @@ class CARLEnsemble:
             CARL.load_from_checkpoint(m["checkpoint"], map_location=map_location)
             for m in self.manifest["members"]
         ]
+        self.release_gpu()
+        return self
+
+    # -- device handling ------------------------------------------------
+    def eval_devices(self, device: str | torch.device | None = None) -> list[str]:
+        """Devices inference runs on.
+
+        An explicit ``device`` wins. Otherwise every GPU in ``training.gpus`` is
+        used -- the same cards the members trained on -- and only without any
+        configured GPU does it fall back to ``cuda:0`` (or the CPU).
+        """
+        if device is not None:
+            return [str(device)]
+        if not torch.cuda.is_available():
+            return ["cpu"]
+        gpus = [g for g in (self.trainer.config.gpus or []) if g is not None]
+        if gpus:
+            return [f"cuda:{int(g)}" for g in dict.fromkeys(gpus)]
+        return ["cuda:0"]
+
+    def release_gpu(self) -> None:
+        """Drop every cached stacked model from the GPUs; members stay loaded on CPU."""
         self._stacked, self._stacked_device = None, None
         self._fold_stacks = {}
-        return self
+        self._stack_cache = {}
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+    # Smallest event chunk a member chunk must leave room for; below this the
+    # stacked forward stops being efficient.
+    MIN_EVAL_BATCH = 4096
+
+    def _member_bytes(self) -> tuple[int, int]:
+        """(fp32 parameter bytes, activation bytes per event) of ONE member."""
+        hp = self.models[0].hparams
+        n_f, n_l, n_h = int(hp["n_features"]), int(hp["n_layers"]), int(hp["n_nodes"])
+        params = n_f * n_h + (n_l - 1) * n_h * n_h + n_h + n_l * n_h + 1
+        return 4 * params, 3 * max(n_h, n_f) * 4  # ~3 live fp32 (M, B, H) tensors
+
+    def _plan_chunks(self, n_members: int, devices: list[str], mem_fraction: float) -> list[np.ndarray]:
+        """Split ``n_members`` positions into contiguous member chunks.
+
+        At least one chunk per device (so every GPU gets work), and each chunk
+        small enough that its weights plus a ``MIN_EVAL_BATCH``-event
+        activation block fit into ``mem_fraction`` of the free memory of the
+        tightest device. A 600-member ensemble of 5x1500 networks is ~22 GB of
+        weights alone, so it can no longer be forced onto one card in one piece.
+        """
+        if n_members == 0:
+            return []
+        if all(not d.startswith("cuda") for d in devices):
+            per_chunk = n_members
+        else:
+            param_b, act_b = self._member_bytes()
+            free = min(torch.cuda.mem_get_info(torch.device(d))[0]
+                       for d in devices if d.startswith("cuda"))
+            per_chunk = max(1, int(mem_fraction * free // (param_b + self.MIN_EVAL_BATCH * act_b)))
+        n_chunks = max(min(len(devices), n_members), math.ceil(n_members / per_chunk))
+        return np.array_split(np.arange(n_members), n_chunks)
+
+    def _predict_members(self, member_idx: list[int], x: torch.Tensor, devices: list[str],
+                         batch_size: int | None, mem_fraction: float,
+                         cache: bool = True) -> np.ndarray:
+        """``(len(member_idx), len(x))`` sigmoid scores of the given members.
+
+        The members are split into chunks (``_plan_chunks``) dealt round-robin
+        to ``devices``; each device works through its chunks in its own thread
+        and writes straight into one preallocated float32 matrix. A chunk's
+        stacked model is cached for later calls only if the whole plan is
+        resident at once (one chunk per device); otherwise it is built, used
+        and freed, so GPU memory stays at one chunk per device.
+        """
+        out = np.empty((len(member_idx), len(x)), dtype=np.float32)
+        if len(member_idx) == 0 or len(x) == 0:
+            return out
+        chunks = self._plan_chunks(len(member_idx), devices, mem_fraction)
+        if len(chunks) > len(devices) and self._stack_cache:
+            # cached stacks are eating the budget: drop them and plan again
+            self.release_gpu()
+            chunks = self._plan_chunks(len(member_idx), devices, mem_fraction)
+        cache = cache and len(chunks) <= len(devices)
+
+        per_dev: dict[str, list[np.ndarray]] = {d: [] for d in devices}
+        for i, pos in enumerate(chunks):
+            per_dev[devices[i % len(devices)]].append(pos)
+
+        def run(dev: str, dev_chunks: list[np.ndarray]) -> None:
+            dev_ctx = torch.cuda.device(dev) if dev.startswith("cuda") else nullcontext()
+            with torch.no_grad(), dev_ctx:  # grad mode is thread-local
+                for pos in dev_chunks:
+                    members = [member_idx[p] for p in pos]
+                    key = (tuple(members), dev)
+                    model = self._stack_cache.get(key)
+                    if model is None:
+                        model = stack_members([self.models[i] for i in members], dev)
+                        if cache:
+                            self._stack_cache[key] = model
+                    bs = batch_size or self._auto_batch_size(model, dev, mem_fraction)
+                    lo, hi = int(pos[0]), int(pos[-1]) + 1
+                    for s in range(0, len(x), bs):
+                        out[lo:hi, s : s + bs] = (
+                            torch.sigmoid(model(x[s : s + bs].to(dev)).float()).cpu().numpy()
+                        )
+                    del model
+                    if not cache and dev.startswith("cuda"):
+                        torch.cuda.empty_cache()
+
+        jobs = [(d, cs) for d, cs in per_dev.items() if cs]
+        if len(jobs) == 1:
+            run(*jobs[0])
+        else:
+            with ThreadPoolExecutor(max_workers=len(jobs)) as pool:
+                for fut in [pool.submit(run, d, cs) for d, cs in jobs]:
+                    fut.result()
+        return out
 
     @torch.no_grad()
     def member_predictions(self, x: torch.Tensor | np.ndarray, device: str | None = None,
@@ -690,39 +808,39 @@ class CARLEnsemble:
                            mem_fraction: float = 0.5) -> np.ndarray:
         """(n_members, n_events) matrix of member scores for SCALED features.
 
-        With ``stacked`` (the default) the members are fused into a single
-        batched module and every member is evaluated in the same pass, which
-        is what the likelihood scan wants: it turns M sequential sweeps over
-        the events into one. The per-model loop is kept as a fallback.
+        With ``stacked`` (the default) the members are fused into batched
+        modules and evaluated in one pass per chunk of members, which is what
+        the likelihood scan wants: it turns M sequential sweeps over the
+        events into a few. The per-model loop is kept as a fallback.
+
+        ``device=None`` spreads the members over every GPU in
+        ``training.gpus``; a large ensemble is split into member chunks that
+        fit the free memory, instead of being stacked whole onto one card.
 
         ``batch_size=None`` sizes the event chunk from the free GPU memory and
-        the ensemble size: the stacked forward keeps ``(M, B, n_nodes)``
+        the chunk size: the stacked forward keeps ``(M, B, n_nodes)``
         activations alive, so a fixed chunk that fits a small ensemble runs
         out of memory for a large one.
         """
         if not self.models:
             self.load()
-        device = device or ("cuda:0" if torch.cuda.is_available() else "cpu")
+        devices = self.eval_devices(device)
         x = torch.as_tensor(x, dtype=torch.float32)
 
         if stacked and len(self.models) > 1:
-            model = self.stacked(device=device)
-            if batch_size is None:
-                batch_size = self._auto_batch_size(model, device, mem_fraction)
-            out = [
-                torch.sigmoid(model(x[i : i + batch_size].to(device))).cpu()
-                for i in range(0, len(x), batch_size)
-            ]
-            return torch.cat(out, dim=1).numpy()
+            return self._predict_members(
+                list(range(len(self.models))), x, devices, batch_size, mem_fraction
+            )
 
+        dev = devices[0]
         batch_size = batch_size or 65536
-        preds = []
-        for model in self.models:
-            model = model.to(device).eval()
-            out = [model(x[i : i + batch_size].to(device)).flatten().cpu() for i in range(0, len(x), batch_size)]
-            preds.append(torch.cat(out).numpy())
+        preds = np.empty((len(self.models), len(x)), dtype=np.float32)
+        for m, model in enumerate(self.models):
+            model = model.to(dev).eval()
+            for i in range(0, len(x), batch_size):
+                preds[m, i : i + batch_size] = model(x[i : i + batch_size].to(dev)).flatten().cpu().numpy()
             model.to("cpu")
-        return np.stack(preds)
+        return preds
 
     @staticmethod
     def _auto_batch_size(model, device: str | torch.device, mem_fraction: float = 0.5) -> int:
@@ -759,7 +877,7 @@ class CARLEnsemble:
             raise ValueError("out-of-fold prediction needs a k-fold ensemble")
         if not self.models:
             self.load()
-        device = device or ("cuda:0" if torch.cuda.is_available() else "cpu")
+        devices = self.eval_devices(device)
         per_fold = self.fold_members()
         sizes = {len(p) for p in per_fold}
         if len(sizes) != 1 or 0 in sizes:
@@ -776,16 +894,9 @@ class CARLEnsemble:
             sel = np.flatnonzero(folds == f)
             if sel.size == 0:
                 continue
-            key = (f, str(device))
-            if key not in self._fold_stacks:
-                self._fold_stacks[key] = stack_members([self.models[i] for i in members], device)
-            model = self._fold_stacks[key]
-            bs = batch_size or self._auto_batch_size(model, device, mem_fraction)
-            xs = x[torch.as_tensor(sel)]
-            out[:, sel] = torch.cat(
-                [torch.sigmoid(model(xs[i : i + bs].to(device))).cpu()
-                 for i in range(0, len(xs), bs)], dim=1
-            ).numpy()
+            out[:, sel] = self._predict_members(
+                members, x[torch.as_tensor(sel)], devices, batch_size, mem_fraction
+            )
         return out
 
     def inference_out_of_fold(self, x, folds, device: str | None = None) -> np.ndarray:
@@ -825,31 +936,39 @@ class CARLEnsemble:
           its own fold's members only.
 
         and returns ``{"test": ..., "out_of_fold": ...}``.
-        """
-        if self.config.kfold:
-            if folds is None:
-                raise ValueError("k-fold evaluation needs the per-event fold array")
-            idx = np.asarray(idx)
-            f = np.asarray(folds)[idx]
-            results: dict = {}
-            test_idx, cv_idx = idx[f == TEST_FOLD], idx[f != TEST_FOLD]
-            if test_idx.size:
-                results["test"] = self._run_suite(
-                    dataset, test_idx,
-                    self.member_predictions(dataset.x.numpy()[test_idx], device=device), tag,
-                )
-            if cv_idx.size:
-                results["out_of_fold"] = self._run_suite(
-                    dataset, cv_idx,
-                    self.out_of_fold_member_predictions(
-                        dataset.x.numpy()[cv_idx], np.asarray(folds)[cv_idx], device=device
-                    ),
-                    f"{tag}_out_of_fold",
-                )
-            return results
 
-        member_scores = self.member_predictions(dataset.x.numpy()[idx], device=device)
-        return self._run_suite(dataset, idx, member_scores, tag)
+        The GPUs are cleared between the phases and afterwards, so the
+        whole-ensemble stacks of the test pass never sit next to the fold
+        stacks of the out-of-fold pass.
+        """
+        try:
+            if self.config.kfold:
+                if folds is None:
+                    raise ValueError("k-fold evaluation needs the per-event fold array")
+                idx = np.asarray(idx)
+                f = np.asarray(folds)[idx]
+                results: dict = {}
+                test_idx, cv_idx = idx[f == TEST_FOLD], idx[f != TEST_FOLD]
+                if test_idx.size:
+                    scores = self.member_predictions(dataset.x.numpy()[test_idx], device=device)
+                    self.release_gpu()
+                    results["test"] = self._run_suite(dataset, test_idx, scores, tag)
+                    del scores
+                if cv_idx.size:
+                    scores = self.out_of_fold_member_predictions(
+                        dataset.x.numpy()[cv_idx], np.asarray(folds)[cv_idx], device=device
+                    )
+                    self.release_gpu()
+                    results["out_of_fold"] = self._run_suite(
+                        dataset, cv_idx, scores, f"{tag}_out_of_fold"
+                    )
+                return results
+
+            member_scores = self.member_predictions(dataset.x.numpy()[idx], device=device)
+            self.release_gpu()
+            return self._run_suite(dataset, idx, member_scores, tag)
+        finally:
+            self.release_gpu()
 
     def _run_suite(self, dataset: NSBIDataset, idx: np.ndarray, member_scores: np.ndarray,
                    tag: str) -> dict:
@@ -885,13 +1004,16 @@ def stack_members(models: list, device: str | torch.device = "cpu"):
     from .vectorized import StackedMLP
 
     hp = models[0].hparams
-    model = StackedMLP(
-        n_members=len(models),
-        n_features=hp["n_features"],
-        n_layers=hp["n_layers"],
-        n_nodes=hp["n_nodes"],
-        dropout=hp.get("dropout", 0.0),
-    )
+    # Allocate straight on the target device: building on the CPU first and
+    # moving it costs a full host-RAM copy of the stack (GBs for big ensembles).
+    with torch.device(device):
+        model = StackedMLP(
+            n_members=len(models),
+            n_features=hp["n_features"],
+            n_layers=hp["n_layers"],
+            n_nodes=hp["n_nodes"],
+            dropout=hp.get("dropout", 0.0),
+        )
     stride = 3 if hp.get("dropout", 0.0) > 0.0 else 2
     with torch.no_grad():
         for m, member in enumerate(models):
