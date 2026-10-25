@@ -59,9 +59,14 @@ class TrainerConfig:
 
 @dataclass
 class ModelConfig:
-    n_layers: int = 5
-    n_nodes: int = 128
-    dropout: float = 0.0
+    architecture: str = "dnn"       # "dnn" | "transformer"
+    n_layers: int = 5               # dnn only
+    n_nodes: int = 128              # dnn only
+    dropout: float = 0.0            # both architectures
+    tf_d_model: int = 32            # transformer only: token embedding width
+    tf_n_heads: int = 4             # transformer only: attention heads (divides tf_d_model)
+    tf_n_layers: int = 3            # transformer only: encoder blocks
+    tf_ff_dim: int = 64             # transformer only: feed-forward width per block
     scheduler_t0: int = 25
     scheduler_t_mult: int = 1
     scheduler_eta_min: float = 1e-8
@@ -113,6 +118,11 @@ class CARLTrainer:
             scheduler_eta_min=mc.scheduler_eta_min,
             optimizer=self.config.optimizer,
             weight_decay=self.config.weight_decay,
+            architecture=mc.architecture,
+            tf_d_model=mc.tf_d_model,
+            tf_n_heads=mc.tf_n_heads,
+            tf_n_layers=mc.tf_n_layers,
+            tf_ff_dim=mc.tf_ff_dim,
         )
 
     def make_loaders(

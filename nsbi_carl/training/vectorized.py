@@ -31,6 +31,7 @@ bootstrap resample drawn by the same seeded generators.
 
 from __future__ import annotations
 
+import copy
 import json
 from dataclasses import dataclass
 from pathlib import Path
@@ -44,7 +45,7 @@ import lightning as L
 
 from ..data.dataset import NSBIDataset, SplitIndices
 from ..data.reweighting import log_weight_summary
-from ..model import build_mlp
+from ..model import FeatureTransformer, architecture_hparams, build_mlp
 
 
 # ---------------------------------------------------------------------------
@@ -132,6 +133,149 @@ class StackedMLP(nn.Module):
             state[f"net.{idx}.weight"] = self.weights[layer][m].t().detach().cpu().clone()
             state[f"net.{idx}.bias"] = self.biases[layer][m, 0].detach().cpu().clone()
         return state
+
+
+# ---------------------------------------------------------------------------
+def transformer_activation_width(n_features: int, d_model: int, n_heads: int, ff_dim: int) -> int:
+    """Per-event, per-member activation footprint (in floats) of one
+    ``FeatureTransformer`` layer: tokens x widest projection + attention map.
+    Used for inference batch / member-chunk sizing."""
+    T = int(n_features) + 1
+    return T * max(3 * int(d_model), int(ff_dim)) + int(n_heads) * T * T
+
+
+class StackedTransformer(nn.Module):
+    """``n_members`` independent :class:`FeatureTransformer` s in one pass.
+
+    Every parameter of the reference network is stored once with a leading
+    member axis, and the forward is ``torch.func.vmap`` over that axis of a
+    ``functional_call`` into a parameter-less template. Like ``StackedMLP``
+    the members are mathematically independent (disjoint parameter slices),
+    member ``m`` initialises exactly as a standalone ``CARL`` built under
+    ``seed[m]`` would, and ``member_state_dict`` returns ``CARL.net`` naming.
+    """
+
+    def __init__(
+        self,
+        n_members: int,
+        n_features: int,
+        d_model: int = 32,
+        n_heads: int = 4,
+        n_layers: int = 3,
+        ff_dim: int = 64,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.n_members = int(n_members)
+        self.n_features = int(n_features)
+        self.arch = dict(d_model=int(d_model), n_heads=int(n_heads), n_layers=int(n_layers),
+                         ff_dim=int(ff_dim), dropout=float(dropout))
+        ref = self._reference()
+        self._names = [name for name, _ in ref.named_parameters()]
+        self.params = nn.ParameterDict({
+            self._key(name): nn.Parameter(p.detach().unsqueeze(0).repeat(
+                self.n_members, *([1] * p.ndim)).clone())
+            for name, p in ref.named_parameters()
+        })
+        # Parameter-less template the functional call runs through. Kept in a
+        # tuple so it is not registered as a submodule (no duplicate params).
+        self._template = (copy.deepcopy(ref).to("meta"),)
+
+        # Per-event activation footprint, for batch sizing (see
+        # CARLEnsemble._auto_batch_size): tokens x widest layer + attention.
+        self.activation_width = transformer_activation_width(n_features, d_model, n_heads, ff_dim)
+        self.n_nodes = self.activation_width  # legacy attribute read by batch sizing
+
+    def _reference(self) -> FeatureTransformer:
+        return FeatureTransformer(self.n_features, **self.arch)
+
+    @staticmethod
+    def _key(name: str) -> str:
+        return name.replace(".", "__")  # ParameterDict keys may not contain "."
+
+    def train(self, mode: bool = True):
+        super().train(mode)
+        self._template[0].train(mode)  # dropout follows the stacked module
+        return self
+
+    # -- initialisation -----------------------------------------------------
+    def init_from_seeds(self, seeds: list[int]) -> None:
+        if len(seeds) != self.n_members:
+            raise ValueError(f"expected {self.n_members} seeds, got {len(seeds)}")
+        with torch.no_grad():
+            for m, seed in enumerate(seeds):
+                torch.manual_seed(int(seed))
+                ref = self._reference()
+                for name, p in ref.named_parameters():
+                    self.params[self._key(name)][m].copy_(p)
+
+    def load_member_state(self, m: int, state: dict[str, torch.Tensor], prefix: str = "net.") -> None:
+        with torch.no_grad():
+            for name in self._names:
+                self.params[self._key(name)][m].copy_(state[prefix + name])
+
+    # -- forward ------------------------------------------------------------
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        """``x`` ``(M, B, F)`` or shared ``(B, F)`` -> logits ``(M, B)``."""
+        template = self._template[0]
+        params = {name: self.params[self._key(name)] for name in self._names}
+
+        def one(p, xx):
+            return torch.func.functional_call(template, p, (xx,)).squeeze(-1)
+
+        x_dim = 0 if x.dim() == 3 else None
+        return torch.func.vmap(one, in_dims=(0, x_dim), randomness="different")(params, x)
+
+    # -- export -------------------------------------------------------------
+    def member_state_dict(self, m: int) -> dict[str, torch.Tensor]:
+        return {
+            f"net.{name}": self.params[self._key(name)][m].detach().cpu().clone()
+            for name in self._names
+        }
+
+
+def build_stacked(n_members: int, n_features: int, model_config=None, hp: dict | None = None) -> nn.Module:
+    """Stacked module for the configured architecture.
+
+    Pass either a ``ModelConfig`` (training) or a CARL ``hparams`` mapping
+    (re-stacking trained members for inference).
+    """
+    if hp is None:
+        hp = {k: getattr(model_config, k) for k in (
+            "architecture", "n_layers", "n_nodes", "dropout",
+            "tf_d_model", "tf_n_heads", "tf_n_layers", "tf_ff_dim",
+        ) if hasattr(model_config, k)}
+    a = architecture_hparams(hp)
+    if a["architecture"] == "transformer":
+        return StackedTransformer(
+            n_members, n_features, d_model=a["tf_d_model"], n_heads=a["tf_n_heads"],
+            n_layers=a["tf_n_layers"], ff_dim=a["tf_ff_dim"], dropout=a["dropout"],
+        )
+    return StackedMLP(n_members, n_features, a["n_layers"], a["n_nodes"], a["dropout"])
+
+
+def stack_trained_members(models: list, device: str | torch.device = "cpu") -> nn.Module:
+    """Fuse trained CARL members (either architecture) into one stacked module,
+    allocated directly on ``device``."""
+    hp = models[0].hparams
+    a = architecture_hparams(hp)
+    # Allocate straight on the target device: building on the CPU first and
+    # moving it costs a full host-RAM copy of the stack (GBs for big ensembles).
+    with torch.device(device):
+        model = build_stacked(len(models), hp["n_features"], hp=hp)
+    with torch.no_grad():
+        if a["architecture"] == "transformer":
+            for m, member in enumerate(models):
+                model.load_member_state(m, member.state_dict())
+        else:
+            stride = 3 if a["dropout"] > 0.0 else 2
+            for m, member in enumerate(models):
+                sd = member.state_dict()
+                for layer in range(len(model.weights)):
+                    idx = layer * stride
+                    model.weights[layer][m].copy_(sd[f"net.{idx}.weight"].t())
+                    model.biases[layer][m, 0].copy_(sd[f"net.{idx}.bias"])
+    return model.to(device).eval()
 
 
 # ---------------------------------------------------------------------------
@@ -256,6 +400,11 @@ class VectorizedEnsembleTrainer:
         n_layers = getattr(model_config, "n_layers", 5)
         n_nodes = getattr(model_config, "n_nodes", 128)
         dropout = getattr(model_config, "dropout", 0.0)
+        arch_hp = architecture_hparams(
+            {k: getattr(model_config, k) for k in (
+                "architecture", "tf_d_model", "tf_n_heads", "tf_n_layers", "tf_ff_dim",
+            ) if hasattr(model_config, k)}
+        )
 
         labels = dataset.y.numpy().reshape(-1)
         if train_matrix is not None:
@@ -348,7 +497,7 @@ class VectorizedEnsembleTrainer:
                 strict_balance=False,
             )
 
-        model = StackedMLP(M, dataset.n_features, n_layers, n_nodes, dropout).to(dev)
+        model = build_stacked(M, dataset.n_features, model_config).to(dev)
         model.init_from_seeds(seeds)
         forward = model
         if cfg.compile:
@@ -497,6 +646,11 @@ class VectorizedEnsembleTrainer:
                         "scheduler_eta_min": cfg.scheduler_eta_min,
                         "optimizer": cfg.optimizer,
                         "weight_decay": cfg.weight_decay,
+                        "architecture": arch_hp["architecture"],
+                        "tf_d_model": arch_hp["tf_d_model"],
+                        "tf_n_heads": arch_hp["tf_n_heads"],
+                        "tf_n_layers": arch_hp["tf_n_layers"],
+                        "tf_ff_dim": arch_hp["tf_ff_dim"],
                     },
                     "pytorch-lightning_version": L.__version__,
                     "epoch": len(val_hist),

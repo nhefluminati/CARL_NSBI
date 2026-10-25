@@ -34,7 +34,7 @@ from .evaluation import base as _eval_base
 from .evaluation import metrics as _metrics  # noqa: F401  (populate registries)
 from .evaluation import plots as _plots      # noqa: F401
 from .training.ensemble import CARLEnsemble, EnsembleConfig
-from .model import validate_optimizer
+from .model import validate_architecture, validate_optimizer
 from .training.trainer import CARLTrainer, ModelConfig, TrainerConfig
 
 
@@ -87,17 +87,23 @@ class Pipeline:
 
         model_cfg = config.get("model", {})
         sched_cfg = model_cfg.get("scheduler", {})
+        tf_cfg = model_cfg.get("transformer", {}) or {}
         train_cfg = config.get("training", {})
         perf_cfg = config.get("performance", {})
         eval_cfg = config.get("evaluation", {})
         self.trainer = CARLTrainer(
             model_config=ModelConfig(
+                architecture=validate_architecture(model_cfg.get("architecture", "dnn")),
                 n_layers=model_cfg.get("n_layers", 5),
                 n_nodes=model_cfg.get("n_nodes", 128),
                 dropout=model_cfg.get("dropout", 0.0),
                 scheduler_t0=sched_cfg.get("t0", 25),
                 scheduler_t_mult=sched_cfg.get("t_mult", 1),
                 scheduler_eta_min=sched_cfg.get("eta_min", 1e-8),
+                tf_d_model=tf_cfg.get("d_model", 32),
+                tf_n_heads=tf_cfg.get("n_heads", 4),
+                tf_n_layers=tf_cfg.get("n_layers", 3),
+                tf_ff_dim=tf_cfg.get("ff_dim", 64),
             ),
             trainer_config=TrainerConfig(
                 batch_size=train_cfg.get("batch_size", 512),

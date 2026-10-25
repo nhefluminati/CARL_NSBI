@@ -274,26 +274,9 @@ class EnsembleScorer:
         return len(self.models)
 
     def _build_stacked(self, member_idx: list[int]):
-        from .training.vectorized import StackedMLP
+        from .training.vectorized import stack_trained_members
 
-        models = [self.models[i] for i in member_idx]
-        hp = models[0].hparams
-        model = StackedMLP(
-            n_members=len(models),
-            n_features=hp["n_features"],
-            n_layers=hp["n_layers"],
-            n_nodes=hp["n_nodes"],
-            dropout=hp.get("dropout", 0.0),
-        )
-        stride = 3 if hp.get("dropout", 0.0) > 0.0 else 2
-        with torch.no_grad():
-            for m, member in enumerate(models):
-                sd = member.state_dict()
-                for layer in range(len(model.weights)):
-                    idx = layer * stride
-                    model.weights[layer][m].copy_(sd[f"net.{idx}.weight"].t())
-                    model.biases[layer][m, 0].copy_(sd[f"net.{idx}.bias"])
-        return model.to(self.device).eval()
+        return stack_trained_members([self.models[i] for i in member_idx], self.device)
 
     def scale(self, x_raw: np.ndarray) -> np.ndarray:
         x = np.asarray(x_raw, dtype=np.float64)

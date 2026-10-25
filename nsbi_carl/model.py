@@ -1,8 +1,15 @@
 """The CARL classifier as a LightningModule.
 
-Architecture: configurable feed-forward network, swish (SiLU) activations in
-the hidden layers, single sigmoid output. Trained with a weighted binary
-cross entropy and a CosineAnnealingWarmRestarts schedule.
+Architecture: selected by ``architecture``:
+
+* ``"dnn"`` (default): configurable feed-forward network, swish (SiLU)
+  activations in the hidden layers.
+* ``"transformer"``: a small feature-tokenising transformer
+  (:class:`FeatureTransformer`): every input feature becomes one token, a
+  learned [CLS] token attends over them, and the [CLS] state is read out.
+
+Both end in a single logit (sigmoid in ``forward``) and are trained with a
+weighted binary cross entropy and a CosineAnnealingWarmRestarts schedule.
 
 Auxiliary diagnostics: an :class:`~nsbi_carl.evaluation.base.EvaluationSuite`
 can be attached (``model.evaluation = suite``). At the end of every
@@ -70,6 +77,141 @@ def build_mlp(n_features: int, n_layers: int, n_nodes: int, dropout: float) -> n
     return nn.Sequential(*layers)
 
 
+# ---------------------------------------------------------------------------
+# Transformer variant
+# ---------------------------------------------------------------------------
+ARCHITECTURES = ("dnn", "transformer")
+
+
+def validate_architecture(name: str) -> str:
+    key = str(name).lower()
+    if key in ("mlp", "ffnn", "fcnn"):
+        key = "dnn"
+    if key not in ARCHITECTURES:
+        raise ValueError(f"Unknown model architecture {name!r}; use one of {ARCHITECTURES}.")
+    return key
+
+
+class TransformerBlock(nn.Module):
+    """Pre-norm encoder block: self-attention + SiLU feed-forward.
+
+    Attention is written out explicitly (no ``nn.MultiheadAttention``) so the
+    block has no fused "fast path" and runs unchanged under ``torch.func.vmap``,
+    which is how the vectorized ensemble trainer batches the members.
+    """
+
+    def __init__(self, d_model: int, n_heads: int, ff_dim: int, dropout: float = 0.0):
+        super().__init__()
+        if d_model % n_heads:
+            raise ValueError(f"d_model ({d_model}) must be divisible by n_heads ({n_heads})")
+        self.n_heads = int(n_heads)
+        self.head_dim = d_model // n_heads
+        self.dropout = float(dropout)
+        self.norm1 = nn.LayerNorm(d_model)
+        self.qkv = nn.Linear(d_model, 3 * d_model)
+        self.proj = nn.Linear(d_model, d_model)
+        self.norm2 = nn.LayerNorm(d_model)
+        self.ff1 = nn.Linear(d_model, ff_dim)
+        self.ff2 = nn.Linear(ff_dim, d_model)
+
+    def _drop(self, t: torch.Tensor) -> torch.Tensor:
+        return F.dropout(t, p=self.dropout, training=self.training) if self.dropout > 0.0 else t
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        B, T, D = h.shape
+        q, k, v = self.qkv(self.norm1(h)).chunk(3, dim=-1)
+        q, k, v = (t.reshape(B, T, self.n_heads, self.head_dim).transpose(1, 2) for t in (q, k, v))
+        att = torch.softmax((q @ k.transpose(-2, -1)) * self.head_dim ** -0.5, dim=-1)
+        a = (self._drop(att) @ v).transpose(1, 2).reshape(B, T, D)
+        h = h + self._drop(self.proj(a))
+        h = h + self._drop(self.ff2(self._drop(F.silu(self.ff1(self.norm2(h))))))
+        return h
+
+
+class FeatureTransformer(nn.Module):
+    """Simple transformer for tabular inputs (FT-Transformer style).
+
+    ``x`` ``(B, F)`` -> tokens ``(B, F, d)`` via a per-feature affine embedding
+    ``x_f * W_f + b_f``, a learned [CLS] token is prepended, ``n_layers``
+    encoder blocks run over the ``F + 1`` tokens and the final [CLS] state is
+    mapped to one logit. Returns ``(B, 1)``, the same shape as ``build_mlp``.
+
+    The logit head is a broadcast multiply + sum rather than ``nn.Linear(d, 1)``
+    for the same reason as ``StackedMLP``'s head: a batched matmul with inner
+    dimension 1 in the backward is routed to a runtime-compiled Triton kernel.
+    """
+
+    def __init__(
+        self,
+        n_features: int,
+        d_model: int = 32,
+        n_heads: int = 4,
+        n_layers: int = 3,
+        ff_dim: int = 64,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        self.n_features = int(n_features)
+        self.d_model = int(d_model)
+        bound = d_model ** -0.5
+        self.tok_weight = nn.Parameter(torch.empty(n_features, d_model).uniform_(-bound, bound))
+        self.tok_bias = nn.Parameter(torch.empty(n_features, d_model).uniform_(-bound, bound))
+        self.cls = nn.Parameter(torch.empty(d_model).uniform_(-bound, bound))
+        self.blocks = nn.ModuleList(
+            [TransformerBlock(d_model, n_heads, ff_dim, dropout) for _ in range(n_layers)]
+        )
+        self.norm = nn.LayerNorm(d_model)
+        self.head_weight = nn.Parameter(torch.empty(d_model).uniform_(-bound, bound))
+        self.head_bias = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        tokens = x.unsqueeze(-1) * self.tok_weight + self.tok_bias           # (B, F, d)
+        cls = self.cls.expand(x.shape[0], 1, self.d_model)                    # (B, 1, d)
+        h = torch.cat([cls, tokens], dim=1)                                   # (B, F+1, d)
+        for block in self.blocks:
+            h = block(h)
+        z = self.norm(h[:, 0])                                                # (B, d)
+        return (z * self.head_weight).sum(-1, keepdim=True) + self.head_bias  # (B, 1)
+
+
+def build_network(
+    n_features: int,
+    architecture: str = "dnn",
+    n_layers: int = 5,
+    n_nodes: int = 128,
+    dropout: float = 0.0,
+    tf_d_model: int = 32,
+    tf_n_heads: int = 4,
+    tf_n_layers: int = 3,
+    tf_ff_dim: int = 64,
+) -> nn.Module:
+    """The network behind ``CARL.net`` for either architecture."""
+    if validate_architecture(architecture) == "transformer":
+        return FeatureTransformer(
+            n_features, d_model=tf_d_model, n_heads=tf_n_heads,
+            n_layers=tf_n_layers, ff_dim=tf_ff_dim, dropout=dropout,
+        )
+    return build_mlp(n_features, n_layers, n_nodes, dropout)
+
+
+def architecture_hparams(hp) -> dict:
+    """The network-defining hyperparameters of a CARL ``hparams`` mapping.
+
+    Checkpoints written before the transformer option existed carry no
+    ``architecture`` key; they are DNNs.
+    """
+    return dict(
+        architecture=validate_architecture(hp.get("architecture", "dnn")),
+        n_layers=hp.get("n_layers", 5),
+        n_nodes=hp.get("n_nodes", 128),
+        dropout=hp.get("dropout", 0.0),
+        tf_d_model=hp.get("tf_d_model", 32),
+        tf_n_heads=hp.get("tf_n_heads", 4),
+        tf_n_layers=hp.get("tf_n_layers", 3),
+        tf_ff_dim=hp.get("tf_ff_dim", 64),
+    )
+
+
 class CARL(L.LightningModule):
     def __init__(
         self,
@@ -84,11 +226,26 @@ class CARL(L.LightningModule):
         scheduler_eta_min: float = 1e-8,
         optimizer: str = "sgd",
         weight_decay: float = 0.0,
+        architecture: str = "dnn",
+        tf_d_model: int = 32,
+        tf_n_heads: int = 4,
+        tf_n_layers: int = 3,
+        tf_ff_dim: int = 64,
     ):
         super().__init__()
         self.save_hyperparameters()
 
-        self.net = build_mlp(n_features, n_layers, n_nodes, dropout)
+        self.net = build_network(
+            n_features,
+            architecture=architecture,
+            n_layers=n_layers,
+            n_nodes=n_nodes,
+            dropout=dropout,
+            tf_d_model=tf_d_model,
+            tf_n_heads=tf_n_heads,
+            tf_n_layers=tf_n_layers,
+            tf_ff_dim=tf_ff_dim,
+        )
 
         # Attached by the trainer; not a hyperparameter.
         self.evaluation: EvaluationSuite = EvaluationSuite()

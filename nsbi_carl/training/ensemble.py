@@ -720,7 +720,17 @@ class CARLEnsemble:
 
     def _member_bytes(self) -> tuple[int, int]:
         """(fp32 parameter bytes, activation bytes per event) of ONE member."""
+        from ..model import architecture_hparams
+        from .vectorized import transformer_activation_width
+
         hp = self.models[0].hparams
+        a = architecture_hparams(hp)
+        if a["architecture"] == "transformer":
+            params = sum(p.numel() for p in self.models[0].net.parameters())
+            width = transformer_activation_width(
+                int(hp["n_features"]), a["tf_d_model"], a["tf_n_heads"], a["tf_ff_dim"]
+            )
+            return 4 * params, 3 * width * 4
         n_f, n_l, n_h = int(hp["n_features"]), int(hp["n_layers"]), int(hp["n_nodes"])
         params = n_f * n_h + (n_l - 1) * n_h * n_h + n_h + n_l * n_h + 1
         return 4 * params, 3 * max(n_h, n_f) * 4  # ~3 live fp32 (M, B, H) tensors
@@ -850,12 +860,12 @@ class CARLEnsemble:
             return 65536
         torch.cuda.empty_cache()
         free, _ = torch.cuda.mem_get_info(dev)
-        width = max(model.n_nodes, model.n_features)
+        width = getattr(model, "activation_width", max(model.n_nodes, model.n_features))
         per_event = 3 * model.n_members * width * 4  # ~3 live fp32 (M, B, H) tensors per layer
         return int(max(1024, min(262144, mem_fraction * free // per_event)))
 
     def stacked(self, device: str | torch.device = "cpu"):
-        """Fuse the loaded members into one :class:`StackedMLP` for inference."""
+        """Fuse the loaded members into one stacked module for inference."""
         if self._stacked is not None and self._stacked_device == str(device):
             return self._stacked
         if not self.models:
@@ -1000,26 +1010,11 @@ class CARLEnsemble:
 
 
 def stack_members(models: list, device: str | torch.device = "cpu"):
-    """Fuse CARL members into one :class:`StackedMLP` (one pass for all)."""
-    from .vectorized import StackedMLP
+    """Fuse CARL members into one stacked module (one pass for all).
 
-    hp = models[0].hparams
-    # Allocate straight on the target device: building on the CPU first and
-    # moving it costs a full host-RAM copy of the stack (GBs for big ensembles).
-    with torch.device(device):
-        model = StackedMLP(
-            n_members=len(models),
-            n_features=hp["n_features"],
-            n_layers=hp["n_layers"],
-            n_nodes=hp["n_nodes"],
-            dropout=hp.get("dropout", 0.0),
-        )
-    stride = 3 if hp.get("dropout", 0.0) > 0.0 else 2
-    with torch.no_grad():
-        for m, member in enumerate(models):
-            sd = member.state_dict()
-            for layer in range(len(model.weights)):
-                idx = layer * stride
-                model.weights[layer][m].copy_(sd[f"net.{idx}.weight"].t())
-                model.biases[layer][m, 0].copy_(sd[f"net.{idx}.bias"])
-    return model.to(device).eval()
+    ``StackedMLP`` for DNN members, ``StackedTransformer`` for transformers.
+    The stack is allocated straight on ``device`` (see ``stack_trained_members``).
+    """
+    from .vectorized import stack_trained_members
+
+    return stack_trained_members(models, device)
