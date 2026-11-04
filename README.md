@@ -99,6 +99,43 @@ own weights.
 
 `tests/reference_test.py` checks all of the above.
 
+### Negative target weights: the neural resampler
+
+For targets with many negative weights, `nsbi_carl.resample` (Nachman &
+Thaler, arXiv:2007.11586) writes a positive weight branch into the input
+files. It regresses `<w|x>` and `<w²|x>` on the CARL features with k-fold
+cross-fitting, then keeps each event with probability `1/K`,
+`K = <w²|x>/<w|x>²`, with weight `<w|x>·K` (dropped events get 0). That
+preserves the density in the CARL features — hence `s/(1-s) = p_t/p_r` —
+and the per-region sum of `w²`. `mode: mean` instead uses `<w|x>` for
+every event (lower variance, but no longer a valid MC stat uncertainty).
+
+```bash
+python -m nsbi_carl.resample --config configs/qq_4l.yaml   # adds 'weight_positive'
+# then in that config:  data.weight_key: weight_positive
+```
+
+Options go in an optional `resampler:` block of the same config (see the
+module docstring). The command writes closure plots and a diagnostics YAML
+to `<output_dir>/resampler/`. Check the closure plots before training on
+the new weights. `tests/resample_test.py` covers the method.
+
+`method: cell` uses cell resampling (Andersen & Maier, arXiv:2109.07851)
+instead. No networks: around every negative-weight seed it gathers nearest
+neighbours until the summed weight is ≥ 0, then sets each member to
+`|w_i|·Σw/Σ|w|`. Each cell's total is conserved exactly, but the
+distributions are smeared on the cell scale (core deficit, excess in the
+tails), and in many features the cells stay wide. `cells_<file>.png` shows
+how far they reach per feature. The paired closure errors account for
+correlations inside a cell.
+
+If features use fill values for undefined quantities (e.g. `dijet_* = -999`
+without two jets), set `resampler.sentinel_below: -900`. Otherwise the
+standardisation squashes the physical range and the regression cannot
+resolve it. The closure test uses paired per-event errors
+(`sqrt(Σ(w_pos − w)²)` per bin), because both histograms come from the same
+events. A chi²/ndf well above 1 there means real bias, not noise.
+
 ## Model
 
 `CARL(LightningModule)`: configurable `n_layers` / `n_nodes` / `dropout`,
