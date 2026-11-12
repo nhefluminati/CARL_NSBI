@@ -26,6 +26,10 @@ Available combiners (``ensemble.combiner`` in the pipeline config):
 
 Every combiner returns a *score* in (0, 1), converted back with s = r/(1+r),
 so everything downstream that computes ``s/(1-s)`` keeps working unchanged.
+Use ``ratio_from_scores`` for that conversion: PARE members can predict
+r < 0, stored as scores outside [0, 1], and those must not be clipped. When
+any member score is outside [0, 1], every combiner works on the signed
+ratios (``_combine_signed``).
 
 Whatever the combiner, the ensemble mean ratio is no longer normalised to
 E_ref[r] = 1 by construction; check (and correct) it downstream as before.
@@ -45,6 +49,34 @@ _EPS = 1e-12
 _OUTLIER_FACTOR = 1e3
 
 
+def ratio_from_scores(scores: np.ndarray, eps: float = _EPS) -> np.ndarray:
+    """``r = s / (1 - s)`` for the package's score convention, signed ratios included.
+
+    BCE scores lie in [0, 1]; they are clipped to [eps, 1 - eps] as before,
+    so r in [~eps, ~1/eps]. PARE can predict r < 0 and stores it as
+    ``s = r / (1 + r)`` outside [0, 1] (s < 0 for -1 < r < 0, s > 1 for
+    r < -1). Clipping those into (0, 1) would turn every r < -1 into
+    r ~ 1/eps, so they are converted exactly instead; only ``|1 - s| < eps``
+    is guarded, keeping its sign. ``s = +-inf`` (r = -1 exactly) gives -1.
+    """
+    s = np.asarray(scores, dtype=np.float64)
+    inside = (s >= 0.0) & (s <= 1.0)
+    if inside.all():
+        s = np.clip(s, eps, 1.0 - eps)
+        return s / (1.0 - s)
+    d = 1.0 - s
+    d = np.where(np.abs(d) < eps, np.where(d < 0, -eps, eps), d)
+    with np.errstate(invalid="ignore"):
+        r = np.where(inside, np.clip(s, eps, 1.0 - eps) / (1.0 - np.clip(s, eps, 1.0 - eps)), s / d)
+    return np.where(np.isinf(s), -1.0, r)
+
+
+def has_signed_scores(scores: np.ndarray) -> bool:
+    """True if any score encodes a negative ratio (lies outside [0, 1])."""
+    s = np.asarray(scores)
+    return bool(((s < 0.0) | (s > 1.0)).any())
+
+
 def validate_combiner(name: str, trim: float = 0.0) -> str:
     if name not in COMBINERS:
         raise ValueError(f"unknown ensemble combiner {name!r}; choose one of {COMBINERS}")
@@ -54,14 +86,24 @@ def validate_combiner(name: str, trim: float = 0.0) -> str:
 
 
 def combine_scores(
-    member_scores: np.ndarray, combiner: str = DEFAULT_COMBINER, trim: float = 0.1
+    member_scores: np.ndarray, combiner: str = DEFAULT_COMBINER, trim: float = 0.1,
+    signed: bool | None = None,
 ) -> np.ndarray:
-    """Collapse an ``(n_members, n_events)`` score matrix to ``(n_events,)``."""
+    """Collapse an ``(n_members, n_events)`` score matrix to ``(n_events,)``.
+
+    ``signed=True`` combines in ratio space (``_combine_signed``) whatever
+    the scores; PARE ensembles pass it so every chunk of a batched scoring
+    pass uses the same rule. ``None`` decides from the scores themselves.
+    """
     validate_combiner(combiner, trim)
     s = np.asarray(member_scores, dtype=np.float64)
     if s.ndim == 1:
         s = s[None, :]
-    if s.shape[0] == 1 or combiner == "mean_score":
+    if s.shape[0] == 1:
+        return s[0]
+    if signed or (signed is None and has_signed_scores(s)):
+        return _combine_signed(s, combiner, trim)
+    if combiner == "mean_score":
         return s.mean(axis=0)
 
     s = np.clip(s, _EPS, 1.0 - _EPS)
@@ -81,6 +123,32 @@ def combine_scores(
         r_sorted = np.sort(r, axis=0)
         r_bar = r_sorted[k : r.shape[0] - k].mean(axis=0)
     return r_bar / (1.0 + r_bar)
+
+
+def _combine_signed(s: np.ndarray, combiner: str, trim: float) -> np.ndarray:
+    """Combine members when some predict r < 0 (PARE).
+
+    Scores outside [0, 1] are not probabilities, and s = r/(1+r) is not
+    monotone across r = -1, so averaging or ranking scores is meaningless.
+    Every combiner is evaluated on the signed ratios instead: mean_score and
+    mean_ratio -> mean of r, median_ratio -> median, trimmed_ratio ->
+    trimmed mean. mean_logit needs r > 0 and is refused.
+    """
+    if combiner == "mean_logit":
+        raise ValueError(
+            "mean_logit needs positive ratios, but some members predict r < 0 (PARE). "
+            "Use mean_ratio, trimmed_ratio or median_ratio."
+        )
+    r = ratio_from_scores(s)
+    if combiner == "median_ratio":
+        r_bar = np.median(r, axis=0)
+    elif combiner == "trimmed_ratio":
+        k = int(np.floor(trim * r.shape[0]))
+        r_bar = np.sort(r, axis=0)[k : r.shape[0] - k].mean(axis=0)
+    else:  # mean_score, mean_ratio
+        r_bar = r.mean(axis=0)
+    with np.errstate(divide="ignore"):
+        return r_bar / (1.0 + r_bar)
 
 
 def _warn_dominated(r: np.ndarray, r_bar: np.ndarray) -> None:

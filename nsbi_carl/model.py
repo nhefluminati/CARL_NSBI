@@ -8,8 +8,15 @@ Architecture: selected by ``architecture``:
   (:class:`FeatureTransformer`): every input feature becomes one token, a
   learned [CLS] token attends over them, and the [CLS] state is read out.
 
-Both end in a single logit (sigmoid in ``forward``) and are trained with a
-weighted binary cross entropy and a CosineAnnealingWarmRestarts schedule.
+Both end in a single output unit and train with a CosineAnnealingWarmRestarts
+schedule. The loss is selected by ``loss``:
+
+* ``"bce"`` (default): the output is a logit, trained with a weighted binary
+  cross entropy; ``forward`` applies the sigmoid.
+* ``"pare"``: the output is the raw PARE estimator, trained with the weighted
+  pole-adjustable ratio estimation loss (see ``LOSSES`` below), which keeps
+  negatively weighted events and negative ratios inside a well-posed problem.
+  ``forward`` decodes it to the same score convention as BCE.
 
 Auxiliary diagnostics: an :class:`~nsbi_carl.evaluation.base.EvaluationSuite`
 can be attached (``model.evaluation = suite``). At the end of every
@@ -20,7 +27,7 @@ written to ``aux_dir`` tagged with the epoch.
 Performance notes
 -----------------
 * ``val_loss`` is accumulated on the device as two running scalars
-  (Σ w·bce and Σ w) and reduced across ranks with a single two-element
+  (Σ w·loss and Σ w; float64 for PARE) and reduced across ranks with a single two-element
   ``all_reduce``. The previous implementation moved *every* validation
   feature, label, weight and logit to the CPU each epoch and, under DDP,
   ``all_gather``-ed the full feature matrix — on a 1M-event validation split
@@ -63,6 +70,181 @@ def weighted_bce_sums(
     """
     bce = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
     return (bce * weights).sum(), weights.sum()
+
+
+# ---------------------------------------------------------------------------
+# Loss functions
+# ---------------------------------------------------------------------------
+# "bce":  weighted binary cross entropy on a logit head; s = sigmoid(z) and the
+#         ratio is r = s / (1 - s). Cannot represent r < 0.
+# "pare": pole-adjustable ratio estimation (Drnevich, Jiggins, Katzy, Cranmer,
+#         Mach. Learn.: Sci. Technol. 6 (2025) 045023, eq. 8-10):
+#
+#             L(s, y; t) = (1 - s * t_y)^2,   t = (t0, t1)
+#
+#         The raw network output s is unbounded (no sigmoid). Its optimum is
+#
+#             s* = (t0 + t1 r) / (t0^2 + t1^2 r)
+#
+#         with r = q(x|target) / q(x|reference), invertible to
+#
+#             r  = t0 (1 - t0 s) / (t1 (t1 s - 1)).
+#
+#         The transform's only pole sits at r_pole = -(t0/t1)^2 instead of at
+#         r = -1 (MSE) or r = 0 (BCE), so negative ratios and negative weights
+#         stay inside a smooth, bounded-below problem as long as the true ratio
+#         stays above r_pole. Per eq. (32)-(34) of the paper, pick t0/t1 so that
+#         |t0/t1| comfortably exceeds the largest |r| expected; the
+#         defaults (25619, 58) are the paper's, |t0/t1| ~ 442.
+#
+#         Output parametrization (``pare_param``):
+#
+#         "raw"   the network output IS s, exactly as in the paper. With a
+#                 large |t0/t1| the whole useful range r in [0, 100] maps into
+#                 an output window ~1e-5 wide around 1/t0, next to the decode
+#                 pole at s = 1/t1. Optimiser steps on a wide network are far
+#                 coarser than that window, so from-scratch training jitters
+#                 and can cross the pole (ratios of 1e16). Kept for checkpoints
+#                 trained that way.
+#         "ratio" (default) the network outputs u with s = (1 + rho u) / t0,
+#                 rho = t1 / t0, and the loss is PARE / rho^2 minus its
+#                 constant:
+#
+#                     l(u, y=0) = u^2,   l(u, y=1) = rho^2 u^2 - 2 (1 - rho) u
+#
+#                 An affine map of the output and a positive rescaling of the
+#                 loss, so the minimiser and the pole are the paper's:
+#                 u* = r (1 - rho) / (1 + rho^2 r) ~ r, and the decode is
+#                 r = u / (1 - rho - rho^2 u). The output is O(r), the loss
+#                 and gradients are O(1), and nothing cancels numerically. As
+#                 rho -> 0 this is least-squares density-ratio fitting (uLSIF).
+LOSSES = ("bce", "pare")
+PARE_PARAMS = ("raw", "ratio")
+PARE_DEFAULT_T0 = 25619.0
+PARE_DEFAULT_T1 = 58.0
+
+
+def validate_pare_param(name: str) -> str:
+    key = str(name).lower()
+    if key not in PARE_PARAMS:
+        raise ValueError(f"Unknown PARE parametrization {name!r}; use one of {PARE_PARAMS}.")
+    return key
+
+
+def validate_loss(name: str, t0: float = PARE_DEFAULT_T0, t1: float = PARE_DEFAULT_T1) -> str:
+    key = str(name).lower()
+    if key not in LOSSES:
+        raise ValueError(f"Unknown loss {name!r}; use one of {LOSSES}.")
+    if key == "pare":
+        t0, t1 = float(t0), float(t1)
+        if t0 == 0.0 or t1 == 0.0:
+            raise ValueError(f"PARE needs non-zero t0 and t1, got t0={t0}, t1={t1}.")
+        if t0 == t1:
+            # s* = 1/t for every r: the optimum carries no information.
+            raise ValueError(f"PARE needs t0 != t1 (got {t0}); the optimum is then constant.")
+    return key
+
+
+def pare_pole(t0: float, t1: float) -> float:
+    """``r_pole = -(t0/t1)^2``: the one ratio the PARE optimum cannot express."""
+    return -((float(t0) / float(t1)) ** 2)
+
+
+def weighted_pare(s: torch.Tensor, targets: torch.Tensor, weights: torch.Tensor,
+                  t0: float, t1: float, param: str = "raw") -> torch.Tensor:
+    """Weighted PARE loss on the network output (see ``weighted_pare_sums``)."""
+    num, den = weighted_pare_sums(s, targets, weights, t0, t1, param=param,
+                                  accumulate_dtype=None)
+    return num / den
+
+
+def weighted_pare_sums(
+    s: torch.Tensor, targets: torch.Tensor, weights: torch.Tensor, t0: float, t1: float,
+    accumulate_dtype: torch.dtype | None = torch.float64, param: str = "raw",
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``(Σ w l(out, y), Σ w)``, optionally accumulated in float64.
+
+    ``param="raw"``:   l = (1 - s t_y)^2 on the raw output s (the paper).
+    ``param="ratio"``: l = u^2 (y=0), rho^2 u^2 - 2 (1 - rho) u (y=1) on the
+                       reparametrized output u; same minimiser (module notes).
+
+    float64 matters for monitoring the raw form: its loss sits near a
+    constant and improves by O((t1/t0)^2). Training uses the dtype of ``s``.
+    """
+    if accumulate_dtype is not None:
+        s, weights = s.to(accumulate_dtype), weights.to(accumulate_dtype)
+    if param == "ratio":
+        rho = float(t1) / float(t0)
+        per_event = torch.where(targets > 0.5, rho * rho * s * s - 2.0 * (1.0 - rho) * s, s * s)
+        return (per_event * weights).sum(dim=-1), weights.sum(dim=-1)
+    t = torch.where(targets > 0.5, torch.as_tensor(float(t1), dtype=s.dtype, device=s.device),
+                    torch.as_tensor(float(t0), dtype=s.dtype, device=s.device))
+    per_event = (1.0 - s * t) ** 2
+    return (per_event * weights).sum(dim=-1), weights.sum(dim=-1)
+
+
+def pare_ratio(s: torch.Tensor, t0: float, t1: float, param: str = "raw") -> torch.Tensor:
+    """Density ratio from a PARE output (inverse of eq. 9), in float64."""
+    s = s.double()
+    if param == "ratio":
+        rho = float(t1) / float(t0)
+        return s / (1.0 - rho - rho * rho * s)
+    return t0 * (1.0 - t0 * s) / (t1 * (t1 * s - 1.0))
+
+
+def scores_from_output(out: torch.Tensor, loss: str = "bce",
+                       t0: float = PARE_DEFAULT_T0, t1: float = PARE_DEFAULT_T1,
+                       param: str = "raw") -> torch.Tensor:
+    """Map the raw network output to the package-wide *score* convention.
+
+    Everything downstream (combiners, evaluation, inference, diagnostics)
+    works with a score ``s`` and the ratio ``r = s / (1 - s)``. For BCE that
+    score is the sigmoid. For PARE the ratio is decoded first and then
+    re-encoded as ``s = r / (1 + r)``, so ``s / (1 - s)`` returns exactly the
+    PARE ratio and no consumer needs to know which loss trained the network.
+
+    For ``r >= 0`` this score lies in [0, 1) like a sigmoid. A negative PARE
+    ratio gives a score outside [0, 1] (``s < 0`` for ``-1 < r < 0``, ``s > 1``
+    for ``r < -1``); it still round-trips through ``s/(1-s)``, but the
+    existing consumers clip scores to (0, 1) and therefore treat it as r ~ 0.
+    Returned in the dtype of ``out`` (float64 internally for PARE).
+    """
+    if loss == "pare":
+        r = pare_ratio(out, t0, t1, param)
+        return (r / (1.0 + r)).to(out.dtype)
+    return torch.sigmoid(out)
+
+
+def loss_hparams(hp) -> dict:
+    """``loss``, ``pare_t0``, ``pare_t1``, ``pare_param`` of a CARL ``hparams``.
+
+    Checkpoints written before PARE existed carry none of these; they are BCE.
+    PARE checkpoints without ``pare_param`` predate the reparametrization and
+    are ``raw``.
+    """
+    return dict(
+        loss=validate_loss(hp.get("loss", "bce"), hp.get("pare_t0", PARE_DEFAULT_T0),
+                           hp.get("pare_t1", PARE_DEFAULT_T1)),
+        pare_t0=float(hp.get("pare_t0", PARE_DEFAULT_T0)),
+        pare_t1=float(hp.get("pare_t1", PARE_DEFAULT_T1)),
+        pare_param=validate_pare_param(hp.get("pare_param", "raw")),
+    )
+
+
+def common_loss_hparams(models: list) -> dict:
+    """The shared loss settings of a list of CARL members.
+
+    Members are fused into one stacked module and decoded by one rule, so a
+    mix (BCE members next to PARE members, or two different t) is refused.
+    """
+    settings = [loss_hparams(m.hparams) for m in models]
+    for other in settings[1:]:
+        if other != settings[0]:
+            raise ValueError(
+                f"Ensemble members disagree on the loss / PARE parameters ({settings[0]} vs "
+                f"{other}); their outputs cannot be decoded by one rule."
+            )
+    return settings[0]
 
 
 def build_mlp(n_features: int, n_layers: int, n_nodes: int, dropout: float) -> nn.Sequential:
@@ -231,9 +413,20 @@ class CARL(L.LightningModule):
         tf_n_heads: int = 4,
         tf_n_layers: int = 3,
         tf_ff_dim: int = 64,
+        loss: str = "bce",
+        pare_t0: float = PARE_DEFAULT_T0,
+        pare_t1: float = PARE_DEFAULT_T1,
+        pare_param: str = "raw",   # "raw" only so old PARE checkpoints load; see ModelConfig
     ):
         super().__init__()
+        validate_loss(loss, pare_t0, pare_t1)
+        validate_pare_param(pare_param)
         self.save_hyperparameters()
+        lh = loss_hparams(self.hparams)
+        self.loss_name: str = lh["loss"]
+        self.pare_t0: float = lh["pare_t0"]
+        self.pare_t1: float = lh["pare_t1"]
+        self.pare_param: str = lh["pare_param"]
 
         self.net = build_network(
             n_features,
@@ -262,11 +455,27 @@ class CARL(L.LightningModule):
 
     # ------------------------------------------------------------------
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return torch.sigmoid(self.net(x))
+        return self.scores(self.net(x))
+
+    def scores(self, out: torch.Tensor) -> torch.Tensor:
+        """Raw network output -> score with ``r = s/(1-s)`` (see ``scores_from_output``)."""
+        return scores_from_output(out, self.loss_name, self.pare_t0, self.pare_t1,
+                                  self.pare_param)
+
+    def _loss(self, out: torch.Tensor, y: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+        if self.loss_name == "pare":
+            return weighted_pare(out, y, w, self.pare_t0, self.pare_t1, self.pare_param)
+        return weighted_bce_with_logits(out, y, w)
+
+    def _loss_sums(self, out: torch.Tensor, y: torch.Tensor, w: torch.Tensor):
+        if self.loss_name == "pare":
+            return weighted_pare_sums(out, y, w, self.pare_t0, self.pare_t1,
+                                      param=self.pare_param)
+        return weighted_bce_sums(out, y, w)
 
     def training_step(self, batch, batch_idx):
         x, y, w = batch
-        loss = weighted_bce_with_logits(self.net(x).flatten(), y.flatten(), w.flatten())
+        loss = self._loss(self.net(x).flatten(), y.flatten(), w.flatten())
         self.log("train_loss", loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True)
         return loss
 
@@ -288,7 +497,7 @@ class CARL(L.LightningModule):
         y, w = y.flatten(), w.flatten()
         logits = self.net(x).flatten()
 
-        num, den = weighted_bce_sums(logits, y, w)
+        num, den = self._loss_sums(logits, y, w)
         if self._val_num is None:
             self._val_num, self._val_den = num, den
         else:
@@ -331,7 +540,7 @@ class CARL(L.LightningModule):
 
         # Single host transfer, at the very end, only on rank 0.
         ctx = EvaluationContext(
-            scores=torch.sigmoid(logits).double().cpu().numpy(),
+            scores=self.scores(logits.double()).cpu().numpy(),
             labels=y.cpu().numpy(),
             weights=w.double().cpu().numpy(),
             features=x.float().cpu().numpy(),
@@ -346,7 +555,7 @@ class CARL(L.LightningModule):
 
     def predict_step(self, batch, batch_idx):
         x = batch[0] if isinstance(batch, (tuple, list)) else batch
-        return torch.sigmoid(self.net(x)).flatten()
+        return self.scores(self.net(x)).flatten()
 
     # ------------------------------------------------------------------
     def configure_optimizers(self):

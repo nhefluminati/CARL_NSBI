@@ -45,7 +45,13 @@ import lightning as L
 
 from ..data.dataset import NSBIDataset, SplitIndices
 from ..data.reweighting import log_weight_summary
-from ..model import FeatureTransformer, architecture_hparams, build_mlp
+from ..model import (
+    FeatureTransformer,
+    architecture_hparams,
+    build_mlp,
+    loss_hparams,
+    weighted_pare_sums,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -405,6 +411,28 @@ class VectorizedEnsembleTrainer:
                 "architecture", "tf_d_model", "tf_n_heads", "tf_n_layers", "tf_ff_dim",
             ) if hasattr(model_config, k)}
         )
+        loss_hp = loss_hparams(
+            {k: getattr(model_config, k) for k in ("loss", "pare_t0", "pare_t1", "pare_param")
+             if hasattr(model_config, k)}
+        )
+        use_pare = loss_hp["loss"] == "pare"
+        t0, t1, pare_param = loss_hp["pare_t0"], loss_hp["pare_t1"], loss_hp["pare_param"]
+        if use_pare and cfg.amp_dtype.lower() != "none":
+            raise ValueError(
+                "loss: pare needs a float32 network output; bf16/fp16 cannot resolve the "
+                "O(t1/t0) structure of the PARE estimator. Use performance.precision: 32-true."
+            )
+
+        def loss_sums(out: torch.Tensor, y: torch.Tensor, w: torch.Tensor, train: bool):
+            """Per-member ``(Σ w·loss, Σ w)``; ``out``/``y``/``w`` are ``(M, B)``
+            (``y`` may broadcast). Validation sums are float64 for PARE."""
+            if use_pare:
+                return weighted_pare_sums(
+                    out.float(), y.expand_as(out), w.expand_as(out), t0, t1,
+                    accumulate_dtype=None if train else torch.float64, param=pare_param,
+                )
+            bce = F.binary_cross_entropy_with_logits(out.float(), y.expand_as(out), reduction="none")
+            return (bce * w).sum(dim=1), w.expand_as(out).sum(dim=1)
 
         labels = dataset.y.numpy().reshape(-1)
         if train_matrix is not None:
@@ -509,7 +537,9 @@ class VectorizedEnsembleTrainer:
         )
         scaler = torch.amp.GradScaler("cuda", enabled=(cfg.amp_dtype.lower() == "fp16" and dev.type == "cuda"))
 
-        best_val = torch.full((M,), float("inf"), device=dev)
+        # PARE monitors in float64 (see model.weighted_pare_sums).
+        acc_dtype = torch.float64 if use_pare else torch.float32
+        best_val = torch.full((M,), float("inf"), device=dev, dtype=acc_dtype)
         stale = torch.zeros(M, dtype=torch.long, device=dev)
         best_state: dict[int, dict[str, torch.Tensor]] = {}
         train_hist: list[list[float]] = []
@@ -519,13 +549,23 @@ class VectorizedEnsembleTrainer:
         gen.manual_seed(int(seeds[0]))
 
         n_batches = max(1, n_train // cfg.batch_size)
+        # PARE losses sit near a constant; show enough digits to see progress.
+        fmt = ".10f" if use_pare else ".6f"
+        if use_pare:
+            from ..model import pare_pole
+
+            print(
+                f"[{self.run_name}] loss: PARE ({pare_param})  t0={t0:g}  t1={t1:g}  "
+                f"r_pole={pare_pole(t0, t1):.6g}  min_delta={cfg.min_delta:g}",
+                flush=True,
+            )
 
         for epoch in range(cfg.max_epochs):
             # ---- train ------------------------------------------------
             model.train()
             perm = torch.argsort(torch.rand(M, n_train, device=dev, generator=gen), dim=1)
-            epoch_num = torch.zeros(M, device=dev)
-            epoch_den = torch.zeros(M, device=dev)
+            epoch_num = torch.zeros(M, device=dev, dtype=acc_dtype)
+            epoch_den = torch.zeros(M, device=dev, dtype=acc_dtype)
 
             for b in range(n_batches):
                 sel = perm[:, b * cfg.batch_size : (b + 1) * cfg.batch_size]
@@ -542,9 +582,7 @@ class VectorizedEnsembleTrainer:
 
                 with self._autocast():
                     logits = forward(xb)                         # (M, B)
-                    bce = F.binary_cross_entropy_with_logits(logits.float(), yb, reduction="none")
-                    num = (bce * wb).sum(dim=1)
-                    den = wb.sum(dim=1)
+                    num, den = loss_sums(logits, yb, wb, train=True)
                     per_member = num / den
                     # Disjoint parameters => summing is per-member independent.
                     loss = per_member.sum()
@@ -566,8 +604,8 @@ class VectorizedEnsembleTrainer:
 
             # ---- validate --------------------------------------------
             model.eval()
-            vnum = torch.zeros(M, device=dev)
-            vden = torch.zeros(M, device=dev)
+            vnum = torch.zeros(M, device=dev, dtype=acc_dtype)
+            vden = torch.zeros(M, device=dev, dtype=acc_dtype)
             with torch.no_grad():
                 if per_member_val:
                     for s in range(0, val_t.shape[1], cfg.val_batch_size):
@@ -580,11 +618,9 @@ class VectorizedEnsembleTrainer:
                             wv = wv * val_mask_t[:, s : s + cfg.val_batch_size]
                         with self._autocast():
                             logits = forward(x_all[idx])                  # (M, B)
-                        bce = F.binary_cross_entropy_with_logits(
-                            logits.float(), yv, reduction="none"
-                        )
-                        vnum += (bce * wv).sum(dim=1)
-                        vden += wv.sum(dim=1)
+                        num, den = loss_sums(logits, yv, wv, train=False)
+                        vnum += num
+                        vden += den
                 else:
                     for s in range(0, x_val.shape[0], cfg.val_batch_size):
                         xv = x_val[s : s + cfg.val_batch_size]
@@ -592,11 +628,9 @@ class VectorizedEnsembleTrainer:
                         wv = w_val[s : s + cfg.val_batch_size]
                         with self._autocast():
                             logits = forward(xv)                     # (M, B) broadcast, no copy
-                        bce = F.binary_cross_entropy_with_logits(
-                            logits.float(), yv.expand_as(logits), reduction="none"
-                        )
-                        vnum += (bce * wv).sum(dim=1)
-                        vden += wv.sum()
+                        num, den = loss_sums(logits, yv, wv, train=False)
+                        vnum += num
+                        vden += den
             val_loss = vnum / vden
 
             train_hist.append(train_loss.tolist())
@@ -613,7 +647,7 @@ class VectorizedEnsembleTrainer:
             if cfg.log_every_n_epochs and epoch % cfg.log_every_n_epochs == 0:
                 print(
                     f"[{self.run_name}] epoch {epoch:4d}  "
-                    f"train {train_loss.mean().item():.6f}  val {val_loss.mean().item():.6f}  "
+                    f"train {train_loss.mean().item():{fmt}}  val {val_loss.mean().item():{fmt}}  "
                     f"converged {int((stale >= cfg.early_stopping_patience).sum())}/{M}",
                     flush=True,
                 )
@@ -651,6 +685,10 @@ class VectorizedEnsembleTrainer:
                         "tf_n_heads": arch_hp["tf_n_heads"],
                         "tf_n_layers": arch_hp["tf_n_layers"],
                         "tf_ff_dim": arch_hp["tf_ff_dim"],
+                        "loss": loss_hp["loss"],
+                        "pare_t0": loss_hp["pare_t0"],
+                        "pare_t1": loss_hp["pare_t1"],
+                        "pare_param": loss_hp["pare_param"],
                     },
                     "pytorch-lightning_version": L.__version__,
                     "epoch": len(val_hist),

@@ -124,7 +124,8 @@ def log_weight_summary(weights, labels, tag: str = "", split: str = "train",
     if s["n_negative"]:
         print(
             f"{p}  WARNING: {s['n_negative']:,} negative weights in this split; "
-            "a weighted BCE is not bounded below with those.",
+            "a weighted BCE is not bounded below with those (model.loss: pare stays "
+            "well-posed for ratios above its pole).",
             flush=True,
         )
     return s

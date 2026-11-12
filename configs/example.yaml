@@ -29,6 +29,20 @@ model:
   n_layers: 5
   n_nodes: 256
   dropout: 0.0
+  loss: bce                       # bce | pare
+                                  # pare: pole-adjustable ratio estimation (Drnevich et al.,
+                                  # MLST 6 (2025) 045023). Raw (unbounded) network output,
+                                  # well-posed with negative weights and for ratios down to
+                                  # the pole at r = -(t0/t1)^2. Use with adam/adamw/nadam and
+                                  # performance.precision: 32-true.
+  pare:                           # pare only
+    t0: 25619                     # t for the reference class (y = 0)
+    t1: 58                        # t for the target class (y = 1). Pole at -(t0/t1)^2: keep
+                                  # it far beyond the most negative r you expect.
+    param: ratio                  # ratio (default): network outputs u ~ r, s = (1 + rho u)/t0,
+                                  # rho = t1/t0 -- the same estimator, trainable from scratch.
+                                  # raw: the paper's raw output s; only for fine-tuning a
+                                  # pretrained model, it does not train from scratch.
   scheduler:                      # CosineAnnealingWarmRestarts
     t0: 25                        # restart period (epochs)
     t_mult: 1                     # period multiplication factor after each restart
@@ -41,9 +55,11 @@ training:
   learning_rate: 6.0e-3
   momentum: 0.9
   optimizer: adamw                  # sgd | adam | adamw  
-  weight_decay: 0.0
+  weight_decay: 0.0               # use >= 1e-3 with model.loss: pare (it overfits without)
   max_epochs: 400
   early_stopping_patience: 30
+  min_delta: null                 # smallest val-loss improvement that counts; null ->
+                                  # 1e-6 for bce, 0 for pare (its loss moves by ~1e-7)
   num_workers: 4                  # only used when performance.device_batches is false
   gpus: [0, 1, 2, 3]              
   resume_from: null               # path to a .ckpt to continue a single-model training

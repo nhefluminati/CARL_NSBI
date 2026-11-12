@@ -31,7 +31,7 @@ class LossCurvePlot(Plot):
             ax.plot(hist.get("train_loss", []), alpha=0.5 if many else 1.0, label=f"train{label_suffix}")
             ax.plot(hist.get("val_loss", []), linestyle="--", alpha=0.5 if many else 1.0, label=f"val{label_suffix}")
         ax.set_xlabel("Epoch")
-        ax.set_ylabel("Weighted BCE loss")
+        ax.set_ylabel("Weighted loss (BCE or PARE)")
         ax.set_title("Training / validation loss")
         ax.grid(alpha=0.3)
         if len(ctx.histories) <= 8:

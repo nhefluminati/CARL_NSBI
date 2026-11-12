@@ -35,7 +35,9 @@ class DensityRatioIntegral(Metric):
         if not np.any(ref):
             return {"density_ratio_integral": float("nan"), "density_ratio_integral_deviation": float("nan")}
 
-        r = np.clip(ctx.ratio[ref], 0.0, self.ratio_clip)
+        # Signed: a PARE ratio may be negative and must count as such in
+        # E_ref[r] = 1. BCE ratios are >= 0, so this is the old clip for them.
+        r = np.clip(ctx.ratio[ref], -self.ratio_clip, self.ratio_clip)
         w = ctx.weights[ref].astype(np.float64)
         w_sum = w.sum()
         if w_sum <= 0:

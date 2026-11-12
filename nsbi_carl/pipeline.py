@@ -34,8 +34,26 @@ from .evaluation import base as _eval_base
 from .evaluation import metrics as _metrics  # noqa: F401  (populate registries)
 from .evaluation import plots as _plots      # noqa: F401
 from .training.ensemble import CARLEnsemble, EnsembleConfig
-from .model import validate_architecture, validate_optimizer
-from .training.trainer import CARLTrainer, ModelConfig, TrainerConfig
+from .model import (
+    PARE_DEFAULT_T0,
+    PARE_DEFAULT_T1,
+    pare_pole,
+    validate_architecture,
+    validate_loss,
+    validate_optimizer,
+    validate_pare_param,
+)
+from .training.trainer import CARLTrainer, ModelConfig, TrainerConfig, check_loss_precision
+
+
+def _check_pare_combiner(combiner: str, loss: str) -> str:
+    if loss == "pare" and combiner == "mean_logit":
+        raise ValueError(
+            "ensemble.combiner: mean_logit needs positive ratios, but PARE members can "
+            "predict r < 0. Use mean_ratio (mean_score means the same for PARE), "
+            "trimmed_ratio or median_ratio."
+        )
+    return combiner
 
 
 class Pipeline:
@@ -91,6 +109,43 @@ class Pipeline:
         train_cfg = config.get("training", {})
         perf_cfg = config.get("performance", {})
         eval_cfg = config.get("evaluation", {})
+        pare_cfg = model_cfg.get("pare", {}) or {}
+        pare_t0 = float(pare_cfg.get("t0", PARE_DEFAULT_T0))
+        pare_t1 = float(pare_cfg.get("t1", PARE_DEFAULT_T1))
+        loss = validate_loss(model_cfg.get("loss", "bce"), pare_t0, pare_t1)
+        pare_param = validate_pare_param(pare_cfg.get("param", "ratio"))
+        optimizer = validate_optimizer(train_cfg.get("optimizer", "sgd"))
+        check_loss_precision(loss, perf_cfg.get("precision", "32-true"))
+        if loss == "pare":
+            print(
+                f"[{self.run_name}] loss: PARE ({pare_param}) with t0={pare_t0:g}, t1={pare_t1:g} "
+                f"(pole at r = {pare_pole(pare_t0, pare_t1):.6g}; keep |r| well below "
+                + (f"|t0/t1| = {abs(pare_t0 / pare_t1):.4g})" if pare_param == "raw"
+                   else f"{abs(pare_pole(pare_t0, pare_t1)):.4g})"),
+                flush=True,
+            )
+            if float(train_cfg.get("weight_decay", 0.0)) == 0.0:
+                import warnings
+
+                warnings.warn(
+                    "loss: pare with training.weight_decay: 0. PARE rewards memorizing "
+                    "isolated target events by up to ~(t0/t1)^2 per unit weight, so wide "
+                    "networks overfit within tens of epochs (validation loss climbing, "
+                    "ratios exploding). Start from weight_decay: 1e-3.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+            if optimizer == "sgd" and pare_param == "raw":
+                import warnings
+
+                warnings.warn(
+                    "loss: pare (raw) with optimizer: sgd. The PARE gradients scale with t0, t1 "
+                    f"(here up to {max(abs(pare_t0), abs(pare_t1)):g}), so a learning rate "
+                    "tuned for BCE will diverge. The paper trains PARE with Adam; use "
+                    "adam / adamw / nadam, or lower the SGD learning rate drastically.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
         self.trainer = CARLTrainer(
             model_config=ModelConfig(
                 architecture=validate_architecture(model_cfg.get("architecture", "dnn")),
@@ -104,6 +159,10 @@ class Pipeline:
                 tf_n_heads=tf_cfg.get("n_heads", 4),
                 tf_n_layers=tf_cfg.get("n_layers", 3),
                 tf_ff_dim=tf_cfg.get("ff_dim", 64),
+                loss=loss,
+                pare_t0=pare_t0,
+                pare_t1=pare_t1,
+                pare_param=pare_param,
             ),
             trainer_config=TrainerConfig(
                 batch_size=train_cfg.get("batch_size", 512),
@@ -112,10 +171,11 @@ class Pipeline:
                 momentum=train_cfg.get("momentum", 0.0),
                 max_epochs=train_cfg.get("max_epochs", 400),
                 early_stopping_patience=train_cfg.get("early_stopping_patience", 25),
+                min_delta=train_cfg.get("min_delta"),
                 num_workers=train_cfg.get("num_workers", 4),
                 gpus=train_cfg.get("gpus", []) or [],
                 resume_from=train_cfg.get("resume_from"),
-                optimizer=validate_optimizer(train_cfg.get("optimizer", "sgd")),
+                optimizer=optimizer,
                 weight_decay=train_cfg.get("weight_decay", 0.0),
                 precision=perf_cfg.get("precision", "32-true"),
                 device_batches=perf_cfg.get("device_batches", True),
@@ -148,10 +208,10 @@ class Pipeline:
                     mode=ens_cfg.get("mode", "vectorized"),
                     members_per_group=ens_cfg.get("members_per_group", 0),
                     kfold_stack_folds=bool(ens_cfg.get("kfold_stack_folds", False)),
-                    combiner=validate_combiner(
+                    combiner=_check_pare_combiner(validate_combiner(
                         ens_cfg.get("combiner", DEFAULT_COMBINER),
                         ens_cfg.get("combiner_trim", 0.1),
-                    ),
+                    ), loss),
                     combiner_trim=float(ens_cfg.get("combiner_trim", 0.1)),
                     k_folds=self.kfold_step.k if self.kfold_step else 0,
                     fold_seed=self.kfold_step.fold_seed if self.kfold_step else DEFAULT_FOLD_SEED,

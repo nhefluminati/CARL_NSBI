@@ -143,6 +143,92 @@ swish (SiLU) hidden activations, single sigmoid output, weighted BCE loss,
 SGD optimizer, `CosineAnnealingWarmRestarts(T_0, T_mult, eta_min)` scheduler.
 Train/val loss are logged each epoch.
 
+### Loss: `bce` or `pare`
+
+`model.loss: pare` trains with the pole-adjustable ratio estimation loss of
+Drnevich, Jiggins, Katzy & Cranmer, *Mach. Learn.: Sci. Technol.* 6 (2025)
+045023:
+
+```
+L(s, y; t) = (1 - s * t_y)^2          s = raw network output (no sigmoid)
+s*         = (t0 + t1 r) / (t0^2 + t1^2 r)
+r          = t0 (1 - t0 s) / (t1 (t1 s - 1))
+```
+
+Why it helps with negative weights: BCE's sigmoid cannot express `r < 0`, and
+wherever the weighted target density is locally negative the BCE has no
+minimum (the optimiser drives those events' score to 0). The PARE loss is
+quadratic in `s`; its population minimum exists and is the ratio for every
+`r > r_pole = -(t0/t1)^2`, negative ratios included. It is the same loss in
+both training paths (Lightning and vectorized ensemble).
+
+**Output parametrization (`model.pare.param`).** Training the paper's raw
+output from scratch does not work with a large `|t0/t1|`: with `t = (25619,
+58)` every ratio in [0, 100] maps into an output window ~1e-5 wide around
+`1/t0`, right next to the decode pole at `s = 1/t1`. The optimiser's steps
+on a wide network are far coarser than that window, so the output jitters,
+warm restarts throw it across the pole, and the decoded ratios explode (the
+paper itself only uses PARE to fine-tune pretrained RoSMM models). The
+default `param: ratio` therefore has the network output `u` with
+`s = (1 + rho u)/t0`, `rho = t1/t0`, and trains on PARE/rho^2 minus its
+constant:
+
+```
+l(u, y=0) = u^2          l(u, y=1) = rho^2 u^2 - 2 (1 - rho) u
+u*        = r (1 - rho) / (1 + rho^2 r)  ~  r          r = u / (1 - rho - rho^2 u)
+```
+
+Same minimiser, same pole, but the output is O(r) and the loss O(1). The
+loss can be negative; that is expected (it is ~ -E_target[r] at the
+optimum). `param: raw` keeps the paper's form, and old PARE checkpoints
+load as raw.
+
+```yaml
+model:
+  loss: pare
+  pare: {t0: 25619, t1: 58, param: ratio}   # the paper's t: r_pole ~ -1.95e5
+training:
+  optimizer: adamw               # param: raw with SGD warns (gradients scale with t)
+  min_delta: null                # -> 0 for pare
+performance:
+  precision: 32-true             # bf16/fp16 is refused for pare
+```
+
+Choosing `t`: only `rho = t1/t0` shapes the problem. With `param: ratio` the
+estimator is linear in `r` for `|r| << |r_pole| = 1/rho^2`, so the default
+leaves ample room; a smaller `|r_pole|` only matters if it approaches the
+ratios you need. With `param: raw` follow the paper's App. A.4: keep `|t0/t1|`
+well above the largest `|r|`, but not so far that the loss flattens.
+
+Things that behave differently with PARE:
+
+* **Output decoding.** Checkpoints store `loss`, `pare_t0`, `pare_t1`. Every
+  consumer (`CARL.forward`, ensemble scoring, `inference.EnsembleScorer`)
+  decodes the raw output and re-encodes the ratio as `s = r/(1+r)`, so
+  `r = s/(1-s)` holds unchanged downstream. Old checkpoints load as BCE.
+  Members with different loss settings cannot be stacked together.
+* **Negative ratios downstream.** A negative PARE ratio is stored as a
+  score outside [0, 1] (`s < 0` for `-1 < r < 0`, `s > 1` for `r < -1`).
+  Convert scores with `combine.ratio_from_scores`, never with a (0, 1) clip:
+  clipping turns every `r < -1` into `r ~ 1e12`. The evaluation context,
+  the integral metric (now signed) and the diagnostics use it. PARE
+  ensembles combine members in ratio space (`mean_score` = `mean_ratio`);
+  `mean_logit` is refused. Code of your own that reads scores (likelihood
+  scans) must do the same.
+* **Overfitting.** PARE rewards memorization far more than BCE: an isolated
+  target event the network can carve out lowers the loss by up to
+  `w (1-rho)^2/rho^2` (~2e5 w at the default t), against at most `w log 2`
+  for BCE. A wide network without regularisation finds those events within
+  a few dozen epochs (validation loss climbing at the end of each cosine
+  cycle, training loss far below -1). Use `training.weight_decay`; 1e-3
+  removed the effect entirely in a 4x256 toy with 7 noise features, while
+  a smaller `|t0/t1|` or a bounded output only softened it. The pipeline
+  warns when PARE runs with `weight_decay: 0`.
+* **Loss values.** Validation sums are accumulated in float64, logs print
+  more digits, and the early-stopping `min_delta` defaults to 0 instead of
+  1e-6 (with `param: raw` the loss sits near a constant and improves by
+  O((t1/t0)^2)).
+
 ## Metrics & plots
 
 Metrics implement `.evaluate(ctx)`, plots implement `.plot(ctx)`. They are

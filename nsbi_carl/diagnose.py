@@ -70,10 +70,12 @@ def ratio_report(
     eps: float = 1e-9,
 ) -> dict:
     """Both closure identities, plus where the ratio saturates."""
-    s_t = np.clip(scorer.score(x_target), eps, 1.0 - eps)
-    s_r = np.clip(scorer.score(x_ref), eps, 1.0 - eps)
-    r_t = s_t / (1.0 - s_t)
-    r_r = s_r / (1.0 - s_r)
+    from .combine import ratio_from_scores
+
+    s_t = scorer.score(x_target)
+    s_r = scorer.score(x_ref)
+    r_t = ratio_from_scores(s_t, eps)
+    r_r = ratio_from_scores(s_r, eps)
 
     w_t = np.asarray(w_target, dtype=np.float64).reshape(-1)
     w_r = np.asarray(w_ref, dtype=np.float64).reshape(-1)

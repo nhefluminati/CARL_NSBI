@@ -45,7 +45,7 @@ from ..data.splitting import DEFAULT_FOLD_SEED, TEST_FOLD, KFoldStep
 from ..evaluation.base import EvaluationContext, EvaluationSuite
 from ..combine import combine_scores
 from ..model import CARL
-from .trainer import CARLTrainer, ModelConfig, TrainerConfig
+from .trainer import CARLTrainer, ModelConfig, TrainerConfig, resolve_min_delta
 
 
 @dataclass
@@ -322,6 +322,7 @@ def _train_group_worker(
         optimizer=tconf.optimizer,
         max_epochs=tconf.max_epochs,
         early_stopping_patience=tconf.early_stopping_patience,
+        min_delta=resolve_min_delta(tconf.min_delta, model_config.get("loss", "bce")),
         scheduler_t0=model_config.get("scheduler_t0", 25),
         scheduler_t_mult=model_config.get("scheduler_t_mult", 1),
         scheduler_eta_min=model_config.get("scheduler_eta_min", 1e-8),
@@ -759,7 +760,8 @@ class CARLEnsemble:
     def _predict_members(self, member_idx: list[int], x: torch.Tensor, devices: list[str],
                          batch_size: int | None, mem_fraction: float,
                          cache: bool = True) -> np.ndarray:
-        """``(len(member_idx), len(x))`` sigmoid scores of the given members.
+        """``(len(member_idx), len(x))`` scores of the given members
+        (sigmoid for BCE members, the decoded PARE ratio as ``r/(1+r)`` for PARE).
 
         The members are split into chunks (``_plan_chunks``) dealt round-robin
         to ``devices``; each device works through its chunks in its own thread
@@ -793,11 +795,12 @@ class CARLEnsemble:
                         model = stack_members([self.models[i] for i in members], dev)
                         if cache:
                             self._stack_cache[key] = model
+                    decode = member_decoder([self.models[i] for i in members])
                     bs = batch_size or self._auto_batch_size(model, dev, mem_fraction)
                     lo, hi = int(pos[0]), int(pos[-1]) + 1
                     for s in range(0, len(x), bs):
                         out[lo:hi, s : s + bs] = (
-                            torch.sigmoid(model(x[s : s + bs].to(dev)).float()).cpu().numpy()
+                            decode(model(x[s : s + bs].to(dev)).float()).cpu().numpy()
                         )
                     del model
                     if not cache and dev.startswith("cuda"):
@@ -921,14 +924,24 @@ class CARLEnsemble:
         if (~test).any():
             out[~test] = combine_scores(
                 self.out_of_fold_member_predictions(x[~test], folds[~test], device=device),
-                self.config.combiner, self.config.combiner_trim,
+                self.config.combiner, self.config.combiner_trim, signed=self.signed_ratios,
             )
         return out
+
+    @property
+    def signed_ratios(self) -> bool | None:
+        """True for PARE ensembles: members may predict r < 0, combine in ratio space."""
+        from ..model import common_loss_hparams
+
+        if not self.models:
+            return None
+        return common_loss_hparams(self.models)["loss"] == "pare"
 
     def inference(self, x: torch.Tensor | np.ndarray, device: str | None = None) -> np.ndarray:
         """Ensembled output, combined per ``EnsembleConfig.combiner``."""
         return combine_scores(self.member_predictions(x, device=device),
-                              self.config.combiner, self.config.combiner_trim)
+                              self.config.combiner, self.config.combiner_trim,
+                              signed=self.signed_ratios)
 
     __call__ = inference
 
@@ -988,7 +1001,8 @@ class CARLEnsemble:
         ]
         ctx = EvaluationContext(
             scores=combine_scores(member_scores, self.config.combiner,
-                                  self.config.combiner_trim).astype(np.float64),
+                                  self.config.combiner_trim,
+                                  signed=self.signed_ratios).astype(np.float64),
             labels=dataset.y.numpy().reshape(-1)[idx],
             weights=dataset.w.numpy().reshape(-1)[idx].astype(np.float64),
             features=dataset.x.numpy()[idx],
@@ -1007,6 +1021,19 @@ class CARLEnsemble:
             with open(out / f"metrics_{tag}.json", "w") as f:
                 json.dump(results, f, indent=2)
         return results
+
+
+def member_decoder(models: list):
+    """Callable mapping the stacked raw output of ``models`` to scores.
+
+    The members must share one loss (and one PARE t); see
+    ``model.common_loss_hparams``.
+    """
+    from ..model import common_loss_hparams, scores_from_output
+
+    lh = common_loss_hparams(models)
+    return lambda out: scores_from_output(out, lh["loss"], lh["pare_t0"], lh["pare_t1"],
+                                          lh["pare_param"])
 
 
 def stack_members(models: list, device: str | torch.device = "cpu"):

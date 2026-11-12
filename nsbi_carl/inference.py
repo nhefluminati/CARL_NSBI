@@ -259,6 +259,14 @@ class EnsembleScorer:
             self._stacks = [self._build_stacked(idx) for idx in record.fold_members]
         else:
             self._stacks = [self._build_stacked(list(range(len(self.models))))]
+        # BCE members output logits, PARE members the raw PARE estimator; both
+        # are decoded to scores with r = s/(1-s). All members share one rule.
+        from .training.ensemble import member_decoder
+
+        self._decode = member_decoder(self.models)
+        from .model import common_loss_hparams
+
+        self._signed = common_loss_hparams(self.models)["loss"] == "pare"
         # One scoring pass evaluates one of these stacks at a time; exposed as
         # `_stacked` for code that sizes batches from its shape.
         self._stacked = self._stacks[0]
@@ -294,7 +302,7 @@ class EnsembleScorer:
         """Yield ``(start, (M, B) scores)`` with ``stacks`` concatenated."""
         for i in range(0, len(xs), batch_size):
             xb = xs[i : i + batch_size].to(self.device)
-            yield i, torch.cat([torch.sigmoid(s(xb)) for s in stacks], dim=0).cpu().numpy()
+            yield i, torch.cat([self._decode(s(xb)) for s in stacks], dim=0).cpu().numpy()
 
     def member_scores(self, x_raw: np.ndarray, batch_size: int = 200_000) -> np.ndarray:
         """``(n_members, n_events)``; in a k-fold run, all folds' members."""
@@ -312,7 +320,8 @@ class EnsembleScorer:
         xs = torch.as_tensor(self.scale(x_raw), dtype=torch.float32)
         out = np.empty(len(xs), dtype=np.float64)
         for i, b in self._batches(xs, self._stacks, batch_size):
-            out[i : i + b.shape[1]] = combine_scores(b, self.combiner, self.combiner_trim)
+            out[i : i + b.shape[1]] = combine_scores(b, self.combiner, self.combiner_trim,
+                                                     signed=self._signed)
         return out
 
     def fold_member_scores(
@@ -358,7 +367,7 @@ class EnsembleScorer:
                 xs = torch.as_tensor(self.scale(np.asarray(x_raw)[sel]), dtype=torch.float32)
                 for i, b in self._batches(xs, [stack], batch_size):
                     out[sel[i : i + b.shape[1]]] = combine_scores(
-                        b, self.combiner, self.combiner_trim
+                        b, self.combiner, self.combiner_trim, signed=self._signed
                     )
         return out
 

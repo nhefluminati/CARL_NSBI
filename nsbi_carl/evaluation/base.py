@@ -40,9 +40,10 @@ class EvaluationContext:
 
     @property
     def ratio(self) -> np.ndarray:
-        """Density ratio r = p_target / p_ref = s / (1 - s)."""
-        s = np.clip(self.scores, 1e-12, 1.0 - 1e-12)
-        return s / (1.0 - s)
+        """Density ratio r = p_target / p_ref = s / (1 - s), signed ratios kept."""
+        from ..combine import ratio_from_scores
+
+        return ratio_from_scores(self.scores)
 
     def features_raw(self) -> np.ndarray:
         """Features in physical units (inverse of the standard scaler)."""

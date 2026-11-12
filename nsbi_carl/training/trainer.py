@@ -23,7 +23,7 @@ from ..data.dataset import NSBIDataset, SplitIndices
 from ..data.fastloader import DeviceBatches, resolve_device
 from ..data.reweighting import log_weight_summary
 from ..evaluation.base import EvaluationContext, EvaluationSuite
-from ..model import CARL
+from ..model import CARL, PARE_DEFAULT_T0, PARE_DEFAULT_T1
 
 
 @dataclass
@@ -34,6 +34,9 @@ class TrainerConfig:
     momentum: float = 0.0
     max_epochs: int = 400
     early_stopping_patience: int = 25
+    # Smallest val-loss decrease that counts as an improvement (early stopping
+    # and best-checkpoint selection). None -> resolve_min_delta(loss).
+    min_delta: float | None = None
     num_workers: int = 4
     gpus: list[int] = field(default_factory=list)  # empty -> CPU
     precision: str = "32-true"
@@ -70,6 +73,34 @@ class ModelConfig:
     scheduler_t0: int = 25
     scheduler_t_mult: int = 1
     scheduler_eta_min: float = 1e-8
+    loss: str = "bce"               # "bce" | "pare"  (see nsbi_carl.model.LOSSES)
+    pare_t0: float = PARE_DEFAULT_T0  # pare only: t for the reference class (y = 0)
+    pare_t1: float = PARE_DEFAULT_T1  # pare only: t for the target class (y = 1)
+    pare_param: str = "ratio"       # pare only: "ratio" (default) | "raw" (paper's output)
+
+
+def check_loss_precision(loss: str, precision: str) -> None:
+    # Kept for both parametrizations: "ratio" would survive bf16 better, but a
+    # likelihood ratio estimate is not the place to save the bits.
+    """PARE needs a float32 output: its information sits in O(t1/t0) relative
+    deviations of the output from 1/t0, far below bf16/fp16 resolution."""
+    if loss == "pare" and not str(precision).startswith(("32", "64")):
+        raise ValueError(
+            f"loss: pare is incompatible with precision {precision!r}; half precision cannot "
+            "resolve the PARE estimator. Use performance.precision: 32-true."
+        )
+
+
+def resolve_min_delta(min_delta: float | None, loss: str) -> float:
+    """Early-stopping threshold.
+
+    BCE keeps the historical 1e-6. For PARE the default is 0: in the raw
+    parametrization genuine improvements are O((t1/t0)^2) ~ 1e-6 or smaller,
+    and in the ratio one the loss has no natural scale to fix a threshold.
+    """
+    if min_delta is not None:
+        return float(min_delta)
+    return 0.0 if loss == "pare" else 1e-6
 
 
 class LossHistory(Callback):
@@ -123,6 +154,10 @@ class CARLTrainer:
             tf_n_heads=mc.tf_n_heads,
             tf_n_layers=mc.tf_n_layers,
             tf_ff_dim=mc.tf_ff_dim,
+            loss=mc.loss,
+            pare_t0=mc.pare_t0,
+            pare_t1=mc.pare_t1,
+            pare_param=mc.pare_param,
         )
 
     def make_loaders(
@@ -184,7 +219,7 @@ class CARLTrainer:
                 monitor="val_loss",
                 mode="min",
                 patience=self.config.early_stopping_patience,
-                min_delta=1e-6,
+                min_delta=resolve_min_delta(self.config.min_delta, self.model_config.loss),
                 check_finite=True,
             ),
         ]
@@ -234,6 +269,7 @@ class CARLTrainer:
         validation always uses ``splits.val``.
         """
         tag = tag or self.run_name
+        check_loss_precision(self.model_config.loss, self.config.precision)
         if gpus_override is not None:
             self.config.gpus = gpus_override
 

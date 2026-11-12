@@ -73,6 +73,41 @@ def test_saturated_member():
         assert _r(combine.combine_scores(s, c))[0] < 1.0, c
 
 
+def test_signed_ratios_round_trip():
+    """PARE scores s = r/(1+r) for r < 0 lie outside [0, 1]; the conversion
+    must return r, not the ~1e12 a (0, 1) clip would produce for r < -1."""
+    r = np.array([-50.0, -3.0, -1.5, -0.999, -0.5, 0.0, 0.3, 1.0, 7.0])
+    with np.errstate(divide="ignore"):
+        s = r / (1.0 + r)
+    got = combine.ratio_from_scores(s)
+    np.testing.assert_allclose(got[r != 0], r[r != 0], rtol=1e-9)
+    assert abs(got[r == 0][0]) < 1e-11
+    assert combine.ratio_from_scores(np.array([np.inf, -np.inf]))[0] == -1.0
+    # BCE scores keep the old clipped behaviour
+    np.testing.assert_allclose(combine.ratio_from_scores(np.array([0.0, 1.0]))[0], 1e-12, rtol=1e-6)
+    assert combine.ratio_from_scores(np.array([1.0]))[0] > 1e11
+
+
+def test_signed_combination_in_ratio_space():
+    r = np.array([[-2.0, 0.5], [-1.5, 0.7], [-1.0 + 1e-9, 0.9]])
+    s = r / (1.0 + r)
+    for c, expect in (("mean_score", r.mean(0)), ("mean_ratio", r.mean(0)),
+                      ("median_ratio", np.median(r, 0)),
+                      ("trimmed_ratio", r.mean(0))):
+        got = combine.ratio_from_scores(combine.combine_scores(s, c, trim=0.0))
+        np.testing.assert_allclose(got, expect, rtol=1e-6, err_msg=c)
+    try:
+        combine.combine_scores(s, "mean_logit")
+        raise AssertionError("mean_logit accepted signed ratios")
+    except ValueError:
+        pass
+    # signed=True: same rule even when this chunk happens to be all in [0, 1]
+    pos = np.array([[0.2, 0.6], [0.4, 0.8]])
+    np.testing.assert_allclose(
+        combine.ratio_from_scores(combine.combine_scores(pos, "mean_score", signed=True)),
+        combine.ratio_from_scores(pos).mean(0), rtol=1e-12)
+
+
 def test_rejects_unknown():
     for bad in (("mean", 0.1), ("trimmed_ratio", 0.5)):
         try:
