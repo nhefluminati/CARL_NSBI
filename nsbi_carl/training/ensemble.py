@@ -759,9 +759,12 @@ class CARLEnsemble:
 
     def _predict_members(self, member_idx: list[int], x: torch.Tensor, devices: list[str],
                          batch_size: int | None, mem_fraction: float,
-                         cache: bool = True) -> np.ndarray:
+                         cache: bool = True, raw: bool = False) -> np.ndarray:
         """``(len(member_idx), len(x))`` scores of the given members
         (sigmoid for BCE members, the decoded PARE ratio as ``r/(1+r)`` for PARE).
+        ``raw=True`` returns the undecoded network output instead (the logit
+        for BCE members), which keeps full precision where the float32
+        sigmoid saturates.
 
         The members are split into chunks (``_plan_chunks``) dealt round-robin
         to ``devices``; each device works through its chunks in its own thread
@@ -795,7 +798,9 @@ class CARLEnsemble:
                         model = stack_members([self.models[i] for i in members], dev)
                         if cache:
                             self._stack_cache[key] = model
-                    decode = member_decoder([self.models[i] for i in members])
+                    decode = (
+                        (lambda t: t) if raw else member_decoder([self.models[i] for i in members])
+                    )
                     bs = batch_size or self._auto_batch_size(model, dev, mem_fraction)
                     lo, hi = int(pos[0]), int(pos[-1]) + 1
                     for s in range(0, len(x), bs):
@@ -818,7 +823,7 @@ class CARLEnsemble:
     @torch.no_grad()
     def member_predictions(self, x: torch.Tensor | np.ndarray, device: str | None = None,
                            batch_size: int | None = None, stacked: bool = True,
-                           mem_fraction: float = 0.5) -> np.ndarray:
+                           mem_fraction: float = 0.5, raw: bool = False) -> np.ndarray:
         """(n_members, n_events) matrix of member scores for SCALED features.
 
         With ``stacked`` (the default) the members are fused into batched
@@ -842,7 +847,7 @@ class CARLEnsemble:
 
         if stacked and len(self.models) > 1:
             return self._predict_members(
-                list(range(len(self.models))), x, devices, batch_size, mem_fraction
+                list(range(len(self.models))), x, devices, batch_size, mem_fraction, raw=raw
             )
 
         dev = devices[0]
@@ -851,7 +856,9 @@ class CARLEnsemble:
         for m, model in enumerate(self.models):
             model = model.to(dev).eval()
             for i in range(0, len(x), batch_size):
-                preds[m, i : i + batch_size] = model(x[i : i + batch_size].to(dev)).flatten().cpu().numpy()
+                xb = x[i : i + batch_size].to(dev)
+                out = model.net(xb) if raw else model(xb)
+                preds[m, i : i + batch_size] = out.flatten().cpu().numpy()
             model.to("cpu")
         return preds
 
@@ -881,7 +888,7 @@ class CARLEnsemble:
     @torch.no_grad()
     def out_of_fold_member_predictions(
         self, x: torch.Tensor | np.ndarray, folds: np.ndarray, device: str | None = None,
-        batch_size: int | None = None, mem_fraction: float = 0.5,
+        batch_size: int | None = None, mem_fraction: float = 0.5, raw: bool = False,
     ) -> np.ndarray:
         """``(members_per_fold, n_events)`` scores for SCALED features, where
         column i comes only from the members of event i's own fold -- the
@@ -908,7 +915,7 @@ class CARLEnsemble:
             if sel.size == 0:
                 continue
             out[:, sel] = self._predict_members(
-                members, x[torch.as_tensor(sel)], devices, batch_size, mem_fraction
+                members, x[torch.as_tensor(sel)], devices, batch_size, mem_fraction, raw=raw
             )
         return out
 

@@ -192,6 +192,18 @@ def pare_ratio(s: torch.Tensor, t0: float, t1: float, param: str = "raw") -> tor
     return t0 * (1.0 - t0 * s) / (t1 * (t1 * s - 1.0))
 
 
+def pare_u_from_ratio(r, t0: float, t1: float):
+    """The ``ratio``-parametrized PARE output for a given ratio (the inverse of
+    ``pare_ratio(..., param="ratio")``): ``u = r (1 - rho) / (1 + rho^2 r)``.
+
+    Lets a model that produces a *ratio* (the RoSMM combination
+    ``c r+ - (c-1) r-``) be trained or scored with the PARE loss, as in the
+    paper's Algorithm 2. Works on torch tensors and numpy arrays alike.
+    """
+    rho = float(t1) / float(t0)
+    return r * (1.0 - rho) / (1.0 + rho * rho * r)
+
+
 def scores_from_output(out: torch.Tensor, loss: str = "bce",
                        t0: float = PARE_DEFAULT_T0, t1: float = PARE_DEFAULT_T1,
                        param: str = "raw") -> torch.Tensor:

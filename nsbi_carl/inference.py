@@ -30,13 +30,13 @@ fast likelihood scan and a slow one.
 from __future__ import annotations
 
 import warnings
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import numpy as np
 import torch
 
-from .combine import DEFAULT_COMBINER, combine_scores, validate_combiner
+from .combine import DEFAULT_COMBINER, combine_scores, ratio_from_scores, validate_combiner
 from .config import load_config
 from .model import CARL
 
@@ -611,15 +611,203 @@ def validate_templates(records, balance_tol: float = 0.01, raise_on_error: bool 
     return problems
 
 
-def load_templates(spec, device: str | torch.device = "cpu", validate: bool = True):
+def is_rosmm_run(run_dir: str | Path, name: str) -> bool:
+    """True if ``<run_dir>/run_config_<name>.yaml`` is a RoSMM template."""
+    path = Path(run_dir) / f"run_config_{name}.yaml"
+    if not path.exists():
+        return False
+    return "rosmm" in (load_config(path) or {})
+
+
+def template_record(run_dir: str | Path, name: str) -> TemplateRecord:
+    """The record that describes a template's inputs (features, scaler, folds,
+    reference). For a RoSMM template that is its ``pos`` sub-run's record --
+    both sub-runs share the parent's scaler, splits and reference -- renamed
+    to the template."""
+    if not is_rosmm_run(run_dir, name):
+        return read_record(run_dir, name)
+    rec = load_config(Path(run_dir) / f"run_config_{name}.yaml")
+    child = rec["rosmm"]["children"]["pos"]
+    sub = read_record(Path(run_dir) / child["dir"], child["name"])
+    return replace(sub, name=name, run_dir=Path(run_dir), raw=rec)
+
+
+def load_templates(spec, device: str | torch.device = "cpu", validate: bool = True,
+                   rosmm_flavor: str | None = None):
     """Load several templates at once.
 
     ``spec`` maps template name -> run directory. Returns
-    ``{name: EnsembleScorer}`` and, unless disabled, validates them together
-    first — which is the only moment the whole set is in view.
+    ``{name: EnsembleScorer}`` (a :class:`RoSMMScorer` for RoSMM templates,
+    which has the same scoring API) and, unless disabled, validates them
+    together first — which is the only moment the whole set is in view.
+    ``rosmm_flavor`` picks the RoSMM flavor (default: the run's own).
     """
-    records = [read_record(run_dir, name) for name, run_dir in spec.items()]
+    records = [template_record(run_dir, name) for name, run_dir in spec.items()]
     if validate:
         print("\n== TEMPLATE VALIDATION ==")
         validate_templates(records)
-    return {r.name: EnsembleScorer(r, device=device) for r in records}
+    out = {}
+    for r in records:
+        if is_rosmm_run(r.run_dir, r.name):
+            out[r.name] = RoSMMScorer(r.run_dir, r.name, device=device, flavor=rosmm_flavor)
+        else:
+            out[r.name] = EnsembleScorer(r, device=device)
+    return out
+
+
+# ---------------------------------------------------------------------------
+class RoSMMScorer:
+    """Scores raw events with a RoSMM template (``rosmm.enabled`` runs).
+
+    The template is two BCE ensembles, ``pos`` (r+) and ``neg`` (r-), paired
+    member by member: pair i gives ``r_i = c_i r+_i - (c_i - 1) r-_i`` and the
+    pairs are combined with the run's combiner in signed ratio space. The API
+    matches :class:`EnsembleScorer`; the scores follow the package convention
+    ``s = r / (1 + r)``, which lies outside [0, 1] where r < 0, so turn them
+    into ratios with :func:`nsbi_carl.combine.ratio_from_scores` -- or call
+    :meth:`ratio` / :meth:`ratio_out_of_fold` directly.
+
+    ``flavor``: ``"rosmm"`` (c from eq. 16), ``"rosmmc"`` (PARE-fitted c) or
+    ``"rosmmr"`` (fully fine-tuned pairs); default: the most tuned flavor the
+    run produced.
+    """
+
+    def __init__(
+        self,
+        run_dir: str | Path,
+        name: str,
+        device: str | torch.device = "cpu",
+        flavor: str | None = None,
+        combiner: str | None = None,
+        combiner_trim: float | None = None,
+    ):
+        run_dir = Path(run_dir)
+        rec = load_config(run_dir / f"run_config_{name}.yaml") or {}
+        ro = rec.get("rosmm")
+        if not ro:
+            raise ValueError(f"[{name}] {run_dir} is not a RoSMM run")
+        if ro.get("status") != "done":
+            raise ValueError(f"[{name}] RoSMM run did not finish (status: {ro.get('status')})")
+        self.flavor = flavor or ro["default_flavor"]
+        if self.flavor not in ro["flavors"]:
+            raise ValueError(
+                f"[{name}] flavor {self.flavor!r} not available; this run has "
+                f"{sorted(ro['flavors'])} (rosmm.tune decides which are produced)"
+            )
+        fl = ro["flavors"][self.flavor]
+        self.name = name
+        self.c_hat = float(ro["c_hat"])
+        self.c = np.asarray(fl["c"], dtype=np.float64)
+
+        subs = {}
+        for part in ("pos", "neg"):
+            child = ro["children"][part]
+            crec = read_record(run_dir / child["dir"], child["name"])
+            if self.flavor == "rosmmr":
+                crec = replace(crec, checkpoints=[str(run_dir / p)
+                                                  for p in fl["checkpoints"][part]])
+            subs[part] = EnsembleScorer(crec, device=device)
+        self.pos, self.neg = subs["pos"], subs["neg"]
+        if self.pos.record.member_tags != self.neg.record.member_tags:
+            raise ValueError(f"[{name}] pos/neg sub-runs have different members")
+        if len(self.c) != self.pos.n_members:
+            raise ValueError(f"[{name}] {len(self.c)} coefficients for {self.pos.n_members} pairs")
+        self.record = replace(self.pos.record, name=name, run_dir=run_dir, raw=rec)
+        self.device = torch.device(device)
+        self._default_combiner = (ro.get("combiner", DEFAULT_COMBINER),
+                                  float(ro.get("combiner_trim", 0.1)))
+        self.set_combiner(combiner, combiner_trim)
+        # c per stacked row: the all-member pass concatenates the fold stacks
+        # in fold order (k-fold) or keeps the manifest order.
+        if self.record.kfold:
+            self._fold_c = [self.c[np.asarray(m)] for m in self.record.fold_members]
+            self._all_c = np.concatenate(self._fold_c)
+        else:
+            self._fold_c = []
+            self._all_c = self.c
+
+    def set_combiner(self, combiner: str | None = None, trim: float | None = None) -> None:
+        self.combiner_trim = float(self._default_combiner[1] if trim is None else trim)
+        self.combiner = validate_combiner(
+            self._default_combiner[0] if combiner is None else combiner, self.combiner_trim
+        )
+        if self.combiner == "mean_logit":
+            raise ValueError("RoSMM ratios are signed; mean_logit is not defined for them")
+
+    @property
+    def n_members(self) -> int:
+        return self.pos.n_members
+
+    # -- internals -------------------------------------------------------
+    @torch.no_grad()
+    def _pair_ratios(self, x_raw: np.ndarray, pos_stacks, neg_stacks, c: np.ndarray,
+                     batch_size: int):
+        """Yield ``(start, (M, B) pair ratios)`` for the given stacks."""
+        from .rosmm import combine_pair_ratios, logits_to_ratio
+
+        xs = torch.as_tensor(self.pos.scale(x_raw), dtype=torch.float32)
+        for i in range(0, len(xs), batch_size):
+            xb = xs[i : i + batch_size].to(self.device)
+            zp = torch.cat([s(xb) for s in pos_stacks], dim=0).cpu().numpy()
+            zn = torch.cat([s(xb) for s in neg_stacks], dim=0).cpu().numpy()
+            yield i, combine_pair_ratios(logits_to_ratio(zp), logits_to_ratio(zn), c)
+
+    def _combine(self, r: np.ndarray) -> np.ndarray:
+        from .rosmm import ratios_to_scores
+
+        return combine_scores(ratios_to_scores(r), self.combiner, self.combiner_trim, signed=True)
+
+    # -- API ---------------------------------------------------------------
+    def member_ratios(self, x_raw: np.ndarray, batch_size: int = 200_000) -> np.ndarray:
+        """``(n_members, n_events)`` pair ratios; k-fold: all folds' pairs, in
+        fold order."""
+        parts = [r for _, r in self._pair_ratios(x_raw, self.pos._stacks, self.neg._stacks,
+                                                   self._all_c, batch_size)]
+        return np.concatenate(parts, axis=1) if parts else np.zeros((self.n_members, 0))
+
+    def member_scores(self, x_raw: np.ndarray, batch_size: int = 200_000) -> np.ndarray:
+        from .rosmm import ratios_to_scores
+
+        return ratios_to_scores(self.member_ratios(x_raw, batch_size))
+
+    def score(self, x_raw: np.ndarray, batch_size: int = 200_000) -> np.ndarray:
+        """Combined score ``r/(1+r)`` from ALL pairs (all folds in k-fold)."""
+        out = np.empty(len(x_raw), dtype=np.float64)
+        for i, r in self._pair_ratios(x_raw, self.pos._stacks, self.neg._stacks, self._all_c,
+                                      batch_size):
+            out[i : i + r.shape[1]] = self._combine(r)
+        return out
+
+    def ratio(self, x_raw: np.ndarray, batch_size: int = 200_000) -> np.ndarray:
+        """Combined density ratio (signed) from ALL pairs."""
+        return ratio_from_scores(self.score(x_raw, batch_size))
+
+    def score_out_of_fold(self, x_raw: np.ndarray, folds: np.ndarray,
+                          batch_size: int = 200_000) -> np.ndarray:
+        """Each event scored only by pairs that never trained on it: its own
+        fold's, or ALL pairs for the untouched test set (fold -1)."""
+        folds = self.pos._check_folds(x_raw, folds)
+        x_raw = np.asarray(x_raw)
+        out = np.empty(len(folds), dtype=np.float64)
+        test = np.flatnonzero(folds < 0)
+        if test.size:
+            out[test] = self.score(x_raw[test], batch_size)
+        for f in range(self.record.k_folds):
+            sel = np.flatnonzero(folds == f)
+            if not sel.size:
+                continue
+            for i, r in self._pair_ratios(x_raw[sel], [self.pos._stacks[f]],
+                                          [self.neg._stacks[f]], self._fold_c[f], batch_size):
+                out[sel[i : i + r.shape[1]]] = self._combine(r)
+        return out
+
+    def ratio_out_of_fold(self, x_raw: np.ndarray, folds: np.ndarray,
+                          batch_size: int = 200_000) -> np.ndarray:
+        return ratio_from_scores(self.score_out_of_fold(x_raw, folds, batch_size))
+
+    def sub_ratios(self, x_raw: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+        """Ensemble-combined ``(r+, r-)`` -- for diagnostics."""
+        return (ratio_from_scores(self.pos.score(x_raw)),
+                ratio_from_scores(self.neg.score(x_raw)))
+
+    __call__ = score

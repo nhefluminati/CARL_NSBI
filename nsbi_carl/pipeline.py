@@ -116,7 +116,12 @@ class Pipeline:
         pare_param = validate_pare_param(pare_cfg.get("param", "ratio"))
         optimizer = validate_optimizer(train_cfg.get("optimizer", "sgd"))
         check_loss_precision(loss, perf_cfg.get("precision", "32-true"))
-        if loss == "pare":
+        rosmm_on = bool((config.get("rosmm") or {}).get("enabled", False))
+        if rosmm_on and loss == "pare":
+            print(f"[{self.run_name}] rosmm: the sub-ratio networks train with BCE; "
+                  "model.loss/model.pare are ignored (the PARE tuning uses rosmm.pare)",
+                  flush=True)
+        if loss == "pare" and not rosmm_on:
             print(
                 f"[{self.run_name}] loss: PARE ({pare_param}) with t0={pare_t0:g}, t1={pare_t1:g} "
                 f"(pole at r = {pare_pole(pare_t0, pare_t1):.6g}; keep |r| well below "
@@ -232,6 +237,16 @@ class Pipeline:
                 "per fold (ensemble.n_members members each)."
             )
 
+        # Ratio of signed mixtures (rosmm.py): train the sign-split sub-ratios
+        # as two child runs and combine them. Validated here so a bad config
+        # fails before any data is read.
+        self.rosmm_config: dict | None = None
+        rosmm_cfg = config.get("rosmm") or {}
+        if rosmm_cfg.get("enabled", False):
+            from .rosmm import validate_rosmm_config
+
+            self.rosmm_config = validate_rosmm_config(config)
+
         # filled by run():
         self.dataset: NSBIDataset | None = None
         self.splits: SplitIndices | None = None
@@ -323,8 +338,49 @@ class Pipeline:
         return dataset, splits
 
     def run(self) -> dict:
-        dataset, splits = self.prepare_data()
+        if self.rosmm_config is not None:
+            from .rosmm import run_rosmm
 
+            return run_rosmm(self)
+        dataset, splits = self.prepare_data()
+        return self._train_and_evaluate(dataset, splits)
+
+    def run_prepared(
+        self,
+        dataset: NSBIDataset,
+        splits: SplitIndices,
+        folds: np.ndarray | None,
+        preprocessing: dict,
+        split_record: dict,
+        extra_record: dict | None = None,
+    ) -> dict:
+        """Train and evaluate on a dataset another pipeline already prepared.
+
+        Used by the RoSMM mode for its sub-ratio runs: the events, their
+        split/fold assignment and the feature scaling come from the parent
+        run, so the sub-networks share one scaler and every event keeps the
+        split it has in the full dataset. ``dataset`` must already be scaled;
+        its weights are (re)balanced here with this run's own ReweightStep,
+        which only applies per-class scalars and so is idempotent on weights
+        the parent already balanced.
+        """
+        self.record.update(run_name=self.run_name, seed=self.seed, config=self.config)
+        self.record.update(
+            features=dataset.feature_names,
+            samples=dataset.sample_names,
+            n_target=dataset.n_target,
+            n_reference=dataset.n_reference,
+            split=split_record,
+            reference_fingerprint=reference_fingerprint(dataset, splits),
+        )
+        if extra_record:
+            self.record.update(**extra_record)
+        self.record.update(reweighting=self.reweight_step.apply(dataset, splits))
+        self.record.update(preprocessing=preprocessing)
+        self.dataset, self.splits, self.folds = dataset, splits, folds
+        return self._train_and_evaluate(dataset, splits)
+
+    def _train_and_evaluate(self, dataset: NSBIDataset, splits: SplitIndices) -> dict:
         if self.ensemble is not None and self.kfold_step is not None:
             summaries = self.ensemble.train(dataset, splits, folds=self.folds)
             k = self.kfold_step.k

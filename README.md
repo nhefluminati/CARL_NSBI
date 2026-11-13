@@ -143,6 +143,71 @@ swish (SiLU) hidden activations, single sigmoid output, weighted BCE loss,
 SGD optimizer, `CosineAnnealingWarmRestarts(T_0, T_mult, eta_min)` scheduler.
 Train/val loss are logged each epoch.
 
+### Negative target weights: RoSMM (`rosmm.enabled`)
+
+The full method of Drnevich, Jiggins, Katzy & Cranmer, *Mach. Learn.: Sci.
+Technol.* 6 (2025) 045023, Sec. 3 (PARE below is one ingredient of it). Split
+the target's events by the sign of their weight; with an all-positive
+reference
+
+```
+q(x|target) = c p+(x) + (1-c) p-(x),    c = Σ_{w>=0} w / Σ w      (eq. 16)
+r(x) = c r+(x) - (c-1) r-(x),           r± = p± / p_ref           (eq. 28)
+```
+
+`r+` (positive-weight target events vs reference) and `r-` (negative-weight
+target events with |w| vs reference) are ordinary CARL problems with positive
+weights, so they train with plain BCE: no negative weight ever enters a
+training loss. The sign comes back only through the constant `c`.
+
+```yaml
+rosmm:
+  enabled: true
+  tune: coefficients        # none (RoSMM) | coefficients (RoSMMc) | full (RoSMMr)
+  pare: {t0: 25619, t1: 58} # used by the tuning steps only
+```
+
+What a run does (`nsbi_carl/rosmm.py`):
+
+1. Prepares the full signed dataset once (split, k-folds, reweighting,
+   scaler) exactly as a normal run.
+2. Cuts the two sub-datasets from it, keeping every event's split / fold and
+   the one scaler, and trains each as an ordinary child run with the
+   configured model/training/ensemble settings and BCE:
+   `<output_dir>/pos` and `<output_dir>/neg`, each with its own record,
+   manifest, checkpoints and closure plots of its sub-ratio.
+3. Pairs member i of `pos` with member i of `neg` (within each fold in
+   k-fold mode), forms `r_i = c_i r+_i - (c_i-1) r-_i`, and combines the pairs
+   with `ensemble.combiner` in signed ratio space.
+4. Flavors, each evaluated with the `after_training` suite
+   (`<output_dir>/evaluation/*_rosmm_test*`, `*_rosmmc_test*`, `*_rosmmr_test*`):
+   * **RoSMM** — `c` from eq. 16 on the train split.
+   * **RoSMMc** (`tune: coefficients`) — `c` refitted by minimising the PARE
+     loss of the combined model with the networks frozen (eq. 18), on events
+     the networks did not train on (validation split, or out-of-fold in
+     k-fold). `rosmm_coefficient_scan.pdf` shows the loss vs `c`.
+   * **RoSMMr** (`tune: full`) — every pair fine-tuned jointly (both networks
+     and its `c`) with the PARE loss on the full signed data, on the pair's
+     own train/val events, early-stopped on validation. Tuned checkpoints go
+     to `<output_dir>/rosmmr/`. Expensive (pairs are tuned one after another)
+     and, as seen with plain PARE, prone to overfitting; keep the learning
+     rate low. The paper finds it adds little over RoSMM/RoSMMc.
+
+Analysis side: `load_templates` returns an `inference.RoSMMScorer` for such a
+run, with the `EnsembleScorer` API (`score`, `score_out_of_fold`,
+`member_scores`, plus `ratio`, `ratio_out_of_fold`, `sub_ratios`). Pick the
+flavor with `RoSMMScorer(run_dir, name, flavor="rosmm"|"rosmmc"|"rosmmr")` or
+`load_templates(..., rosmm_flavor=...)`; the default is the most tuned one the
+run produced. Scores are `r/(1+r)` and lie outside [0, 1] where `r < 0`:
+convert with `combine.ratio_from_scores` or use `ratio()` directly.
+
+Caveats (paper, Sec. 6): the combination subtracts two estimates, so where
+the negative part is large the errors of `r+` and `r-` are amplified (roughly
+with `c`); `r-` needs enough negative-weight events covering the reference
+support. Only the target may be signed (`data.reference_unit_weights: true`
+or `absolute_weights: true` guarantee that); the four-sub-ratio case of eq. 14
+is not implemented. `tests/rosmm_test.py` covers the mode.
+
 ### Loss: `bce` or `pare`
 
 `model.loss: pare` trains with the pole-adjustable ratio estimation loss of
