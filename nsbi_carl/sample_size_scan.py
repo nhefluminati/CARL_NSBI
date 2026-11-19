@@ -39,12 +39,17 @@ Each run's own pipeline output (checkpoints, run record, per-run evaluation
 plots) goes to ``<out>/frac_XXX/``. Its test-set scores are saved to
 ``<out>/frac_XXX/test_scores.npz`` and the comparison plots to ``<out>/``:
 
-* ``calibration_comparison.pdf``: overlaid calibration curves (Wilson
-  error bars, same binning and weights as the ``calibration_curve`` plot of
-  the pipeline) with a residual panel, observed - predicted.
+* ``calibration_frac_XXX.pdf``: one calibration curve per fraction (Wilson
+  error bars, same binning and weights as the pipeline's
+  ``calibration_curve`` plot) with a residual panel, observed - predicted.
+  All files share one residual scale, so they can be compared side by side.
+  The box quotes the ECE and the ``density_ratio_integral`` with its
+  statistical error.
+* ``metrics_vs_fraction.pdf``: the weighted expected calibration error (ECE)
+  and the density-ratio integral ``sum_ref r w / sum_ref w`` (should be 1)
+  against the fraction, both on the common test set.
 * ``score_distributions.pdf``: the test-set score histograms per class.
-* ``sample_size_scan.json``: per-run event counts and the weighted
-  expected calibration error (ECE) per fraction.
+* ``sample_size_scan.json``: per-run event counts, ECE and ratio integral.
 
 The run never writes a reference cache (``data.save_reference`` is ignored),
 so a cache the templates share is never overwritten by a thinned reference.
@@ -323,6 +328,37 @@ def calibration_points(scores, labels, weights, n_bins: int, z: float = 1.0) -> 
             "ece": ece, "bins": bins}
 
 
+def ratio_integral(scores, labels, weights) -> tuple[float, float]:
+    """``density_ratio_integral`` on the test reference events, with its
+    statistical uncertainty.
+
+    I = sum_ref r_i w_i / sum_ref w_i should be 1. Its sampling error is
+    sqrt(sum_ref (w_i/W)^2 (r_i - I)^2): with that, a deviation from 1 can be
+    told apart from test-sample noise, which is the same for every fraction
+    here because every run is scored on the same test events.
+    """
+    from .evaluation.base import EvaluationContext
+    from .evaluation.metrics import DensityRatioIntegral
+
+    ctx = EvaluationContext(scores=np.asarray(scores, dtype=np.float64),
+                            labels=labels, weights=weights)
+    integral = DensityRatioIntegral().evaluate(ctx)["density_ratio_integral"]
+    ref = labels == 0.0
+    r = np.clip(ctx.ratio[ref], -1e13, 1e13)
+    p = weights[ref].astype(np.float64)
+    p = p / p.sum()
+    err = float(np.sqrt(np.sum(p**2 * (r - integral) ** 2)))
+    return float(integral), err
+
+
+def _train_counts_label(counts: dict) -> str:
+    part = counts.get("train") or counts.get("cv") or {}
+    if not part:
+        return ""
+    return (f"train events: target {part.get('target', 0):,d}, "
+            f"reference {part.get('reference', 0):,d}")
+
+
 def plot_comparison(paths: list[Path], out_dir: Path, n_bins: int, title: str) -> None:
     import matplotlib
 
@@ -338,50 +374,85 @@ def plot_comparison(paths: list[Path], out_dir: Path, n_bins: int, title: str) -
             "the same config, seed and split settings"
         )
 
-    # Ordered quantity -> one hue, light to dark; markers as a second cue.
-    cmap = plt.get_cmap("Blues")
-    colors = [cmap(v) for v in np.linspace(0.45, 1.0, len(runs))]
-    markers = ["o", "s", "^", "D", "v", "P", "X", "*"]
-    offsets = (np.arange(len(runs)) - (len(runs) - 1) / 2) * (0.25 / n_bins)
-
-    fig, (ax, axr) = plt.subplots(
-        2, 1, figsize=(7, 8), sharex=True, gridspec_kw={"height_ratios": [3, 1.3]}
-    )
-    ax.plot([0, 1], [0, 1], "--", color="grey", lw=1, label="perfect calibration")
-    axr.axhline(0.0, ls="--", color="grey", lw=1)
-    summary = []
-    for i, run in enumerate(runs):
-        f = float(run["fraction"])
+    # Everything first, so all per-fraction files share one residual scale
+    # and can be compared side by side.
+    results = []
+    for run in runs:
         c = calibration_points(run["scores"], run["labels"], run["weights"], n_bins)
-        v = c["valid"]
-        x = c["centers"][v] + offsets[i]   # small dodge so the error bars stay readable
-        yerr = np.vstack([c["lo"][v], c["hi"][v]])
-        label = f"{f:.0%} of train sample  (ECE {c['ece']:.4f})"
-        kw = dict(color=colors[i], marker=markers[i % len(markers)], ms=4, lw=1.2,
-                  capsize=2, elinewidth=1.0)
-        ax.errorbar(x, c["frac"][v], yerr=yerr, label=label, **kw)
-        axr.errorbar(x, c["frac"][v] - c["centers"][v], yerr=yerr, **kw)
-        counts = json.loads(str(run["counts"]))
-        summary.append({"fraction": f, "ece": c["ece"], "counts": counts})
+        integral, integral_err = ratio_integral(run["scores"], run["labels"], run["weights"])
+        results.append({"run": run, "cal": c, "integral": integral,
+                        "integral_err": integral_err,
+                        "counts": json.loads(str(run["counts"]))})
+    resid_max = max(
+        float(np.nanmax(np.abs(r["cal"]["frac"] - r["cal"]["centers"])[r["cal"]["valid"]]))
+        for r in results
+    )
+    resid_lim = max(0.02, 1.3 * resid_max)
 
-    ax.set_ylabel("Weighted target fraction")
-    ax.set_title(f"Calibration vs training-sample size: {title}")
-    ax.set_xlim(0, 1)
-    ax.set_ylim(0, 1)
-    ax.grid(alpha=0.3)
-    ax.legend(fontsize=9, loc="upper left")
-    axr.set_xlabel(r"Predicted score $\hat{s}$")
-    axr.set_ylabel("observed - predicted")
-    axr.grid(alpha=0.3)
+    # -- one calibration file per fraction --------------------------------
+    for r in results:
+        f = float(r["run"]["fraction"])
+        c, v = r["cal"], r["cal"]["valid"]
+        yerr = np.vstack([c["lo"][v], c["hi"][v]])
+        fig, (ax, axr) = plt.subplots(
+            2, 1, figsize=(6.5, 7.5), sharex=True, gridspec_kw={"height_ratios": [3, 1.3]}
+        )
+        ax.plot([0, 1], [0, 1], "--", color="grey", lw=1, label="perfect calibration")
+        kw = dict(color="#1f5fa8", marker="o", ms=4, lw=1.2, capsize=2, elinewidth=1.0)
+        ax.errorbar(c["centers"][v], c["frac"][v], yerr=yerr, label="classifier", **kw)
+        axr.axhline(0.0, ls="--", color="grey", lw=1)
+        axr.errorbar(c["centers"][v], c["frac"][v] - c["centers"][v], yerr=yerr, **kw)
+
+        text = (f"ECE = {c['ece']:.4f}\n"
+                f"$\\Sigma_{{ref}}\\, r\\,w / \\Sigma_{{ref}}\\, w$ = "
+                f"{r['integral']:.4f} $\\pm$ {r['integral_err']:.4f}\n"
+                f"{_train_counts_label(r['counts'])}")
+        ax.text(0.97, 0.03, text, transform=ax.transAxes, ha="right", va="bottom",
+                fontsize=9, bbox=dict(boxstyle="round", fc="white", ec="0.8"))
+        ax.set_title(f"Calibration, {f:.0%} of the training sample: {title}")
+        ax.set_ylabel("Weighted target fraction")
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.grid(alpha=0.3)
+        ax.legend(loc="upper left", fontsize=9)
+        axr.set_ylim(-resid_lim, resid_lim)
+        axr.set_xlabel(r"Predicted score $\hat{s}$")
+        axr.set_ylabel("observed - predicted")
+        axr.grid(alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(out_dir / f"calibration_frac_{int(round(f * 100)):03d}.pdf")
+        plt.close(fig)
+
+    # -- metrics vs fraction ---------------------------------------------
+    fr = np.array([float(r["run"]["fraction"]) for r in results])
+    fig, (a1, a2) = plt.subplots(2, 1, figsize=(6.5, 6.5), sharex=True)
+    a1.plot(fr, [r["cal"]["ece"] for r in results], "o-", color="#1f5fa8")
+    a1.set_ylabel("ECE (test set)")
+    a1.set_title(f"Calibration and reweighting vs training-sample size: {title}")
+    a1.set_ylim(bottom=0)
+    a1.grid(alpha=0.3)
+    a2.axhline(1.0, ls="--", color="grey", lw=1)
+    a2.errorbar(fr, [r["integral"] for r in results],
+                yerr=[r["integral_err"] for r in results],
+                fmt="o-", color="#1f5fa8", capsize=3)
+    a2.set_ylabel(r"$\Sigma_{ref}\, r\,w / \Sigma_{ref}\, w$ (test set)")
+    a2.set_xlabel("fraction of the training sample used")
+    a2.set_xscale("log")
+    a2.set_xticks(fr)
+    a2.set_xticklabels([f"{x:.0%}" for x in fr])
+    a2.minorticks_off()
+    a2.grid(alpha=0.3)
     fig.tight_layout()
-    fig.savefig(out_dir / "calibration_comparison.pdf")
-    fig.savefig(out_dir / "calibration_comparison.png", dpi=150)
+    fig.savefig(out_dir / "metrics_vs_fraction.pdf")
     plt.close(fig)
 
-    # Score distributions: where the events sit tells which calibration bins matter.
+    # -- score distributions (all fractions; histograms overlay cleanly) --
+    cmap = plt.get_cmap("Blues")
+    colors = [cmap(x) for x in np.linspace(0.45, 1.0, len(results))]
     fig, axes = plt.subplots(1, 2, figsize=(11, 4.5), sharey=True)
     hbins = np.linspace(0, 1, 51)
-    for i, run in enumerate(runs):
+    for i, r in enumerate(results):
+        run = r["run"]
         s = np.clip(run["scores"], 0, 1)
         for ax_, cls, name in ((axes[0], 1.0, "target"), (axes[1], 0.0, "reference")):
             m = run["labels"] == cls
@@ -399,13 +470,20 @@ def plot_comparison(paths: list[Path], out_dir: Path, n_bins: int, title: str) -
     fig.savefig(out_dir / "score_distributions.pdf")
     plt.close(fig)
 
+    summary = [{"fraction": float(r["run"]["fraction"]), "ece": r["cal"]["ece"],
+                "density_ratio_integral": r["integral"],
+                "density_ratio_integral_deviation": r["integral"] - 1.0,
+                "density_ratio_integral_stat_error": r["integral_err"],
+                "counts": r["counts"]} for r in results]
     with open(out_dir / "sample_size_scan.json", "w") as fh:
         json.dump({"test_fingerprint": prints.pop(), "runs": summary}, fh, indent=2)
-    print(f"[sample_size_scan] plots -> {out_dir}/calibration_comparison.pdf, "
-          "score_distributions.pdf", flush=True)
+    print(f"[sample_size_scan] plots -> {out_dir}/calibration_frac_*.pdf, "
+          "metrics_vs_fraction.pdf, score_distributions.pdf", flush=True)
+    print(f"  {'fraction':>8s}  {'ECE':>8s}  {'ratio integral':>22s}", flush=True)
     for s_ in summary:
-        print(f"  {s_['fraction']:>5.0%}  ECE = {s_['ece']:.5f}", flush=True)
-
+        print(f"  {s_['fraction']:>8.0%}  {s_['ece']:>8.5f}  "
+              f"{s_['density_ratio_integral']:>10.5f} +- "
+              f"{s_['density_ratio_integral_stat_error']:.5f}", flush=True)
 
 # ---------------------------------------------------------------------------
 def main(argv: list[str] | None = None) -> None:
